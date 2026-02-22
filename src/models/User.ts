@@ -4,6 +4,7 @@ export interface IUser extends Document {
     name: string;
     phone: string;
     passwordHash: string;
+    encryptedPassword: string;
     adminId: Types.ObjectId;
     deviceId: string | null;
     isDeleted: boolean;
@@ -14,6 +15,7 @@ const userSchema = new Schema<IUser>(
         name: { type: String, required: true, trim: true },
         phone: { type: String, required: true, unique: true, trim: true },
         passwordHash: { type: String, required: true },
+        encryptedPassword: { type: String, default: '' },
         adminId: { type: Schema.Types.ObjectId, ref: 'Admin', required: true },
         deviceId: { type: String, default: null },
         isDeleted: { type: Boolean, default: false },
@@ -22,3 +24,4 @@ const userSchema = new Schema<IUser>(
 );
 
 export const User = mongoose.model<IUser>('User', userSchema);
+

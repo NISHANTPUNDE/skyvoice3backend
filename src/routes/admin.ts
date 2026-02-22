@@ -4,6 +4,7 @@ import { Admin } from '../models/Admin';
 import { User } from '../models/User';
 import { Room } from '../models/Room';
 import { authMiddleware, generateToken } from '../middleware/auth';
+import { encryptPassword, decryptPassword } from '../utils/crypto';
 
 const router = Router();
 
@@ -52,10 +53,12 @@ router.post('/users', authMiddleware(['admin']), async (req: Request, res: Respo
         }
 
         const passwordHash = await bcrypt.hash(password, 10);
+        const encPwd = encryptPassword(password);
         const user = await User.create({
             name,
             phone,
             passwordHash,
+            encryptedPassword: encPwd,
             adminId: req.auth!.id,
         });
 
@@ -77,7 +80,14 @@ router.post('/users', authMiddleware(['admin']), async (req: Request, res: Respo
 router.get('/users', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
         const users = await User.find({ adminId: req.auth!.id }, '-passwordHash').sort({ createdAt: -1 });
-        res.json(users);
+        // Decrypt passwords for admin view
+        const result = users.map(u => {
+            const obj: any = u.toObject();
+            obj.password = obj.encryptedPassword ? decryptPassword(obj.encryptedPassword) : '***';
+            delete obj.encryptedPassword;
+            return obj;
+        });
+        res.json(result);
     } catch (err) {
         console.error('List users error:', err);
         res.status(500).json({ error: 'Server error' });
