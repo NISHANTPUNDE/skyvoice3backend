@@ -7,7 +7,7 @@ export const config = {
     jwtSecret: process.env.JWT_SECRET || 'skyvoice2-secret-key-change-in-production',
 
     // SuperAdmin seed credentials
-    superAdminEmail: process.env.SUPER_ADMIN_EMAIL || 'superadmin@skyvoice.com',
+    superAdminUsername: process.env.SUPER_ADMIN_USERNAME || 'superadmin',
     superAdminPassword: process.env.SUPER_ADMIN_PASSWORD || 'admin123',
 
     // MediaSoup

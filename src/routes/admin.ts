@@ -10,13 +10,13 @@ const router = Router();
 // POST /api/admin/login
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
     try {
-        const { email, password } = req.body;
-        if (!email || !password) {
-            res.status(400).json({ error: 'Email and password are required' });
+        const { username, password } = req.body;
+        if (!username || !password) {
+            res.status(400).json({ error: 'Username and password are required' });
             return;
         }
 
-        const admin = await Admin.findOne({ email: email.toLowerCase(), isActive: true });
+        const admin = await Admin.findOne({ username: username.toLowerCase(), isActive: true });
         if (!admin) {
             res.status(401).json({ error: 'Invalid credentials' });
             return;
@@ -29,7 +29,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
         }
 
         const token = generateToken({ id: String(admin._id), role: 'admin' });
-        res.json({ token, role: 'admin', name: admin.name, email: admin.email, adminId: admin._id });
+        res.json({ token, role: 'admin', name: admin.name, username: admin.username, adminId: admin._id });
     } catch (err) {
         console.error('Admin login error:', err);
         res.status(500).json({ error: 'Server error' });

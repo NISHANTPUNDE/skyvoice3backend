@@ -9,13 +9,13 @@ const router = Router();
 // POST /api/superadmin/login
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
     try {
-        const { email, password } = req.body;
-        if (!email || !password) {
-            res.status(400).json({ error: 'Email and password are required' });
+        const { username, password } = req.body;
+        if (!username || !password) {
+            res.status(400).json({ error: 'Username and password are required' });
             return;
         }
 
-        const superAdmin = await SuperAdmin.findOne({ email: email.toLowerCase() });
+        const superAdmin = await SuperAdmin.findOne({ username: username.toLowerCase() });
         if (!superAdmin) {
             res.status(401).json({ error: 'Invalid credentials' });
             return;
@@ -28,7 +28,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
         }
 
         const token = generateToken({ id: String(superAdmin._id), role: 'superadmin' });
-        res.json({ token, role: 'superadmin', email: superAdmin.email });
+        res.json({ token, role: 'superadmin', username: superAdmin.username });
     } catch (err) {
         console.error('SuperAdmin login error:', err);
         res.status(500).json({ error: 'Server error' });
@@ -38,22 +38,22 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
 // POST /api/superadmin/admins — create admin
 router.post('/admins', authMiddleware(['superadmin']), async (req: Request, res: Response): Promise<void> => {
     try {
-        const { name, email, password } = req.body;
-        if (!name || !email || !password) {
-            res.status(400).json({ error: 'name, email, and password are required' });
+        const { name, username, password } = req.body;
+        if (!name || !username || !password) {
+            res.status(400).json({ error: 'name, username, and password are required' });
             return;
         }
 
-        const existing = await Admin.findOne({ email: email.toLowerCase() });
+        const existing = await Admin.findOne({ username: username.toLowerCase() });
         if (existing) {
-            res.status(409).json({ error: 'Admin with this email already exists' });
+            res.status(409).json({ error: 'Admin with this username already exists' });
             return;
         }
 
         const passwordHash = await bcrypt.hash(password, 10);
         const admin = await Admin.create({
             name,
-            email: email.toLowerCase(),
+            username: username.toLowerCase(),
             passwordHash,
             createdBy: req.auth!.id,
         });
@@ -61,7 +61,7 @@ router.post('/admins', authMiddleware(['superadmin']), async (req: Request, res:
         res.status(201).json({
             _id: admin._id,
             name: admin.name,
-            email: admin.email,
+            username: admin.username,
             isActive: admin.isActive,
             createdAt: (admin as any).createdAt,
         });

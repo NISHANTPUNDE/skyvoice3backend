@@ -28,8 +28,12 @@ interface RoomState {
 const rooms = new Map<string, RoomState>();
 
 function sendJson(ws: WebSocket, data: any) {
-    if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(data));
+    try {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(data));
+        }
+    } catch (err) {
+        console.error('sendJson error:', err);
     }
 }
 
@@ -88,7 +92,12 @@ export function setupWebSocket(httpServer: HttpServer): void {
         });
 
         ws.on('close', () => {
+            console.log(`WS disconnected: role=${auth.role}, id=${auth.id}`);
             handleDisconnect(ws, auth);
+        });
+
+        ws.on('error', (err) => {
+            console.error(`WS error: role=${auth.role}, id=${auth.id}`, err);
         });
     });
 }
@@ -203,7 +212,7 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
 
             const room = rooms.get(msg.roomId);
             if (!room) {
-                sendJson(ws, { type: 'error', message: 'Room not found' });
+                sendJson(ws, { type: 'error', message: 'Room not found or has ended' });
                 return;
             }
 
@@ -344,6 +353,8 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             if (listener) {
                 sendJson(listener.ws, { type: 'kicked', roomId: msg.roomId });
                 cleanupListener(room, msg.userId, msg.roomId);
+                // Close the kicked user's WebSocket
+                try { listener.ws.close(); } catch { /* ignore */ }
             }
             break;
         }
@@ -354,25 +365,7 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                 return;
             }
 
-            const room = rooms.get(msg.roomId);
-            if (!room) return;
-
-            // Notify all listeners
-            for (const [userId, listener] of room.listeners) {
-                sendJson(listener.ws, { type: 'room-ended', roomId: msg.roomId });
-                if (listener.consumer) listener.consumer.close();
-                if (listener.transport) listener.transport.close();
-            }
-
-            // Close admin transport and producer
-            if (room.adminProducer) room.adminProducer.close();
-            if (room.adminProducerTransport) room.adminProducerTransport.close();
-            room.router.close();
-
-            rooms.delete(msg.roomId);
-            await Room.updateOne({ roomId: msg.roomId }, { isActive: false });
-
-            sendJson(ws, { type: 'room-ended', roomId: msg.roomId });
+            await endRoom(msg.roomId, ws);
             break;
         }
 
@@ -381,12 +374,38 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
     }
 }
 
+async function endRoom(roomId: string, adminWs?: WebSocket) {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    // Notify all listeners and close their connections
+    for (const [, listener] of room.listeners) {
+        sendJson(listener.ws, { type: 'room-ended', roomId });
+        try { if (listener.consumer) listener.consumer.close(); } catch { /* ignore */ }
+        try { if (listener.transport) listener.transport.close(); } catch { /* ignore */ }
+        try { listener.ws.close(); } catch { /* ignore */ }
+    }
+
+    // Close admin transport and producer
+    try { if (room.adminProducer) room.adminProducer.close(); } catch { /* ignore */ }
+    try { if (room.adminProducerTransport) room.adminProducerTransport.close(); } catch { /* ignore */ }
+    try { room.router.close(); } catch { /* ignore */ }
+
+    rooms.delete(roomId);
+    await Room.updateOne({ roomId }, { isActive: false }).catch(console.error);
+
+    // Confirm to admin
+    if (adminWs) {
+        sendJson(adminWs, { type: 'room-ended', roomId });
+    }
+}
+
 function cleanupListener(room: RoomState, userId: string, roomId: string) {
     const listener = room.listeners.get(userId);
     if (!listener) return;
 
-    if (listener.consumer) listener.consumer.close();
-    if (listener.transport) listener.transport.close();
+    try { if (listener.consumer) listener.consumer.close(); } catch { /* ignore */ }
+    try { if (listener.transport) listener.transport.close(); } catch { /* ignore */ }
     room.listeners.delete(userId);
 
     // Notify everyone about updated listeners list
@@ -402,18 +421,13 @@ function handleDisconnect(ws: WebSocket, auth: AuthPayload) {
     for (const [roomId, room] of rooms) {
         if (auth.role === 'admin' && room.adminWs === ws) {
             // Admin disconnected — end the room
-            for (const [, listener] of room.listeners) {
-                sendJson(listener.ws, { type: 'room-ended', roomId });
-                if (listener.consumer) listener.consumer.close();
-                if (listener.transport) listener.transport.close();
-            }
-            if (room.adminProducer) room.adminProducer.close();
-            if (room.adminProducerTransport) room.adminProducerTransport.close();
-            room.router.close();
-            rooms.delete(roomId);
-            Room.updateOne({ roomId }, { isActive: false }).catch(console.error);
+            endRoom(roomId).catch(console.error);
         } else if (auth.role === 'user') {
-            cleanupListener(room, auth.id, roomId);
+            // Check if this user's WS matches the disconnecting one
+            const listener = room.listeners.get(auth.id);
+            if (listener && listener.ws === ws) {
+                cleanupListener(room, auth.id, roomId);
+            }
         }
     }
 }

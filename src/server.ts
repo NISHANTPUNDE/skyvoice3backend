@@ -24,11 +24,11 @@ async function main() {
     }
 
     // Seed SuperAdmin if not exists
-    const existingSuperAdmin = await SuperAdmin.findOne({ email: config.superAdminEmail });
+    const existingSuperAdmin = await SuperAdmin.findOne({ username: config.superAdminUsername });
     if (!existingSuperAdmin) {
         const passwordHash = await bcrypt.hash(config.superAdminPassword, 10);
-        await SuperAdmin.create({ email: config.superAdminEmail, passwordHash });
-        console.log(`SuperAdmin seeded: ${config.superAdminEmail}`);
+        await SuperAdmin.create({ username: config.superAdminUsername, passwordHash });
+        console.log(`SuperAdmin seeded: ${config.superAdminUsername}`);
     }
 
     // Create mediasoup workers
