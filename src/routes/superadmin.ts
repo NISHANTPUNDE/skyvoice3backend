@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { Types } from 'mongoose';
 import bcrypt from 'bcryptjs';
 import { SuperAdmin } from '../models/SuperAdmin';
 import { Admin } from '../models/Admin';
@@ -108,7 +109,7 @@ router.put('/admins/:id', authMiddleware(['superadmin']), async (req: Request, r
         const update: any = {};
         if (name) update.name = name;
         if (username) {
-            const existing = await Admin.findOne({ username: username.toLowerCase(), _id: { $ne: req.params.id } });
+            const existing = await Admin.findOne({ username: username.toLowerCase(), _id: { $ne: new Types.ObjectId(req.params.id as string) } });
             if (existing) {
                 res.status(409).json({ error: 'Username already taken' });
                 return;

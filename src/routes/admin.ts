@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
+import { Types } from 'mongoose';
 import { Admin } from '../models/Admin';
 import { User } from '../models/User';
 import { Room } from '../models/Room';
@@ -113,7 +114,7 @@ router.put('/users/:id', authMiddleware(['admin']), async (req: Request, res: Re
         const update: any = {};
         if (name) update.name = name;
         if (username) {
-            const existing = await User.findOne({ username: username.toLowerCase(), _id: { $ne: req.params.id } });
+            const existing = await User.findOne({ username: username.toLowerCase(), _id: { $ne: new Types.ObjectId(req.params.id as string) } });
             if (existing) {
                 res.status(409).json({ error: 'Username already taken' });
                 return;
