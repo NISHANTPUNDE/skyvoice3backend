@@ -86,8 +86,8 @@ router.get('/users', authMiddleware(['admin']), async (req: Request, res: Respon
         const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 30));
         const skip = (page - 1) * limit;
 
-        const total = await User.countDocuments({ adminId: req.auth!.id });
-        const users = await User.find({ adminId: req.auth!.id }, '-passwordHash')
+        const total = await User.countDocuments({ adminId: req.auth!.id, isDeleted: { $ne: true } });
+        const users = await User.find({ adminId: req.auth!.id, isDeleted: { $ne: true } }, '-passwordHash')
             .sort({ createdAt: -1 })
             .skip(skip)
             .limit(limit);
