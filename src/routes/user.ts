@@ -6,16 +6,16 @@ import { authMiddleware, generateToken } from '../middleware/auth';
 
 const router = Router();
 
-// POST /api/user/login
+// POST /api/user/login — login by username
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
     try {
-        const { phone, password, deviceId } = req.body;
-        if (!phone || !password || !deviceId) {
-            res.status(400).json({ error: 'phone, password, and deviceId are required' });
+        const { username, password, deviceId } = req.body;
+        if (!username || !password || !deviceId) {
+            res.status(400).json({ error: 'username, password, and deviceId are required' });
             return;
         }
 
-        const user = await User.findOne({ phone });
+        const user = await User.findOne({ username: username.toLowerCase() });
         if (!user) {
             res.status(401).json({ error: 'Invalid credentials' });
             return;
@@ -41,13 +41,17 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
             return;
         }
 
+        // Get admin name
+        const admin = await (await import('../models/Admin')).Admin.findById(user.adminId, 'name');
+
         const token = generateToken({ id: String(user._id), role: 'user' });
         res.json({
             token,
             role: 'user',
             name: user.name,
-            phone: user.phone,
+            username: user.username,
             adminId: user.adminId,
+            adminName: admin?.name || 'Admin',
             userId: user._id,
         });
     } catch (err) {

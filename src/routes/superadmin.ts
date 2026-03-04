@@ -74,20 +74,80 @@ router.post('/admins', authMiddleware(['superadmin']), async (req: Request, res:
     }
 });
 
-// GET /api/superadmin/admins — list admins
-router.get('/admins', authMiddleware(['superadmin']), async (_req: Request, res: Response): Promise<void> => {
+// GET /api/superadmin/admins — list admins with pagination
+router.get('/admins', authMiddleware(['superadmin']), async (req: Request, res: Response): Promise<void> => {
     try {
-        const admins = await Admin.find({}, '-passwordHash').sort({ createdAt: -1 });
-        // Decrypt passwords for superadmin view
+        const page = Math.max(1, parseInt(req.query.page as string) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 30));
+        const skip = (page - 1) * limit;
+
+        const total = await Admin.countDocuments();
+        const admins = await Admin.find({}, '-passwordHash')
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit);
+
         const result = admins.map(a => {
             const obj: any = a.toObject();
             obj.password = obj.encryptedPassword ? decryptPassword(obj.encryptedPassword) : '***';
             delete obj.encryptedPassword;
             return obj;
         });
-        res.json(result);
+
+        res.json({ admins: result, total, page, pages: Math.ceil(total / limit) });
     } catch (err) {
         console.error('List admins error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// PUT /api/superadmin/admins/:id — update admin
+router.put('/admins/:id', authMiddleware(['superadmin']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const { name, username, password } = req.body;
+        const update: any = {};
+        if (name) update.name = name;
+        if (username) {
+            const existing = await Admin.findOne({ username: username.toLowerCase(), _id: { $ne: req.params.id } });
+            if (existing) {
+                res.status(409).json({ error: 'Username already taken' });
+                return;
+            }
+            update.username = username.toLowerCase();
+        }
+        if (password) {
+            update.passwordHash = await bcrypt.hash(password, 10);
+            update.encryptedPassword = encryptPassword(password);
+        }
+
+        const admin = await Admin.findByIdAndUpdate(req.params.id, update, { new: true, projection: '-passwordHash' });
+        if (!admin) {
+            res.status(404).json({ error: 'Admin not found' });
+            return;
+        }
+        const obj: any = admin.toObject();
+        obj.password = obj.encryptedPassword ? decryptPassword(obj.encryptedPassword) : '***';
+        delete obj.encryptedPassword;
+        res.json(obj);
+    } catch (err) {
+        console.error('Update admin error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// PATCH /api/superadmin/admins/:id/toggle-active — activate/deactivate admin
+router.patch('/admins/:id/toggle-active', authMiddleware(['superadmin']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const admin = await Admin.findById(req.params.id);
+        if (!admin) {
+            res.status(404).json({ error: 'Admin not found' });
+            return;
+        }
+        admin.isActive = !admin.isActive;
+        await admin.save();
+        res.json({ message: admin.isActive ? 'Admin activated' : 'Admin deactivated', isActive: admin.isActive });
+    } catch (err) {
+        console.error('Toggle active error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });

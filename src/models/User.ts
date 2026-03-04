@@ -2,6 +2,7 @@ import mongoose, { Schema, Document, Types } from 'mongoose';
 
 export interface IUser extends Document {
     name: string;
+    username: string;
     phone: string;
     passwordHash: string;
     encryptedPassword: string;
@@ -13,7 +14,8 @@ export interface IUser extends Document {
 const userSchema = new Schema<IUser>(
     {
         name: { type: String, required: true, trim: true },
-        phone: { type: String, required: true, unique: true, trim: true },
+        username: { type: String, required: true, unique: true, lowercase: true, trim: true },
+        phone: { type: String, default: '', trim: true },
         passwordHash: { type: String, required: true },
         encryptedPassword: { type: String, default: '' },
         adminId: { type: Schema.Types.ObjectId, ref: 'Admin', required: true },
@@ -24,4 +26,3 @@ const userSchema = new Schema<IUser>(
 );
 
 export const User = mongoose.model<IUser>('User', userSchema);
-
