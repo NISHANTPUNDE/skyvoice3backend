@@ -82,8 +82,8 @@ router.get('/admins', authMiddleware(['superadmin']), async (req: Request, res: 
         const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 30));
         const skip = (page - 1) * limit;
 
-        const total = await Admin.countDocuments({ isActive: { $ne: false } });
-        const admins = await Admin.find({ isActive: { $ne: false } }, '-passwordHash')
+        const total = await Admin.countDocuments();
+        const admins = await Admin.find({}, '-passwordHash')
             .sort({ createdAt: -1 })
             .skip(skip)
             .limit(limit);
