@@ -18,9 +18,14 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
             return;
         }
 
-        const admin = await Admin.findOne({ username: username.toLowerCase(), isActive: true });
+        const admin = await Admin.findOne({ username: username.toLowerCase() });
         if (!admin) {
             res.status(401).json({ error: 'Invalid credentials' });
+            return;
+        }
+
+        if (!admin.isActive) {
+            res.status(403).json({ error: 'Your account is deactivated. Please contact the Super Admin.' });
             return;
         }
 
@@ -47,7 +52,7 @@ router.post('/users', authMiddleware(['admin']), async (req: Request, res: Respo
             return;
         }
 
-        const existing = await User.findOne({ username: username.toLowerCase() });
+        const existing = await User.findOne({ username: username.toLowerCase(), isDeleted: { $ne: true } });
         if (existing) {
             res.status(409).json({ error: 'User with this username already exists' });
             return;
@@ -163,13 +168,11 @@ router.patch('/users/:id/toggle-active', authMiddleware(['admin']), async (req: 
     }
 });
 
-// DELETE /api/admin/users/:id — soft-delete user
+// DELETE /api/admin/users/:id — permanently delete user
 router.delete('/users/:id', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
-        const user = await User.findOneAndUpdate(
-            { _id: req.params.id, adminId: req.auth!.id },
-            { isDeleted: true },
-            { new: true }
+        const user = await User.findOneAndDelete(
+            { _id: req.params.id, adminId: req.auth!.id }
         );
         if (!user) {
             res.status(404).json({ error: 'User not found' });

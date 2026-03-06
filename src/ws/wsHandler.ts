@@ -64,7 +64,30 @@ function getListenersList(roomId: string): { userId: string; userName: string }[
 export function setupWebSocket(httpServer: HttpServer): void {
     const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
+    // ─── Keepalive: ping all clients every 30s, kill dead ones ───
+    const PING_INTERVAL = 30_000;
+    const aliveMap = new WeakMap<WebSocket, boolean>();
+
+    const keepaliveTimer = setInterval(() => {
+        wss.clients.forEach((ws) => {
+            if (aliveMap.get(ws) === false) {
+                // Didn't respond to last ping — terminate
+                console.log('WS keepalive: terminating unresponsive client');
+                ws.terminate();
+                return;
+            }
+            aliveMap.set(ws, false);
+            try { ws.ping(); } catch { /* ok */ }
+        });
+    }, PING_INTERVAL);
+
+    wss.on('close', () => clearInterval(keepaliveTimer));
+
     wss.on('connection', (ws: WebSocket, req) => {
+        // Mark alive on connect and on every pong
+        aliveMap.set(ws, true);
+        ws.on('pong', () => aliveMap.set(ws, true));
+
         // Authenticate via query param: ?token=xxx
         const url = new URL(req.url || '', `http://${req.headers.host}`);
         const token = url.searchParams.get('token');
