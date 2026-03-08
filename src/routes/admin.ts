@@ -52,10 +52,21 @@ router.post('/users', authMiddleware(['admin']), async (req: Request, res: Respo
             return;
         }
 
-        const existing = await User.findOne({ username: username.toLowerCase(), isDeleted: { $ne: true } });
+        // Check username only within this admin's users
+        const existing = await User.findOne({ username: username.toLowerCase(), adminId: req.auth!.id, isDeleted: { $ne: true } });
         if (existing) {
             res.status(409).json({ error: 'User with this username already exists' });
             return;
+        }
+
+        // Check user limit
+        const admin = await Admin.findById(req.auth!.id);
+        if (admin && admin.userLimit !== undefined && admin.userLimit !== null) {
+            const currentCount = await User.countDocuments({ adminId: req.auth!.id, isDeleted: { $ne: true } });
+            if (currentCount >= admin.userLimit) {
+                res.status(403).json({ error: `User limit reached (${admin.userLimit}). Contact Super Admin to increase your limit.` });
+                return;
+            }
         }
 
         const passwordHash = await bcrypt.hash(password, 10);
@@ -105,7 +116,11 @@ router.get('/users', authMiddleware(['admin']), async (req: Request, res: Respon
             return obj;
         });
 
-        res.json({ users: result, total, page, pages: Math.ceil(total / limit) });
+        // Get admin's user limit
+        const admin = await Admin.findById(req.auth!.id);
+        const userLimit = admin?.userLimit || 0;
+
+        res.json({ users: result, total, page, pages: Math.ceil(total / limit), userLimit });
     } catch (err) {
         console.error('List users error:', err);
         res.status(500).json({ error: 'Server error' });
@@ -119,7 +134,7 @@ router.put('/users/:id', authMiddleware(['admin']), async (req: Request, res: Re
         const update: any = {};
         if (name) update.name = name;
         if (username) {
-            const existing = await User.findOne({ username: username.toLowerCase(), _id: { $ne: new Types.ObjectId(req.params.id as string) } });
+            const existing = await User.findOne({ username: username.toLowerCase(), adminId: req.auth!.id, _id: { $ne: new Types.ObjectId(req.params.id as string) } });
             if (existing) {
                 res.status(409).json({ error: 'Username already taken' });
                 return;

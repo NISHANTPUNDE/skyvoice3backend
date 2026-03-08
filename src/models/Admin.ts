@@ -7,6 +7,7 @@ export interface IAdmin extends Document {
     encryptedPassword: string;
     createdBy: Types.ObjectId;
     isActive: boolean;
+    userLimit: number;
 }
 
 const adminSchema = new Schema<IAdmin>(
@@ -17,6 +18,7 @@ const adminSchema = new Schema<IAdmin>(
         encryptedPassword: { type: String, default: '' },
         createdBy: { type: Schema.Types.ObjectId, ref: 'SuperAdmin', required: true },
         isActive: { type: Boolean, default: true },
+        userLimit: { type: Number, default: 0 },
     },
     { timestamps: true }
 );

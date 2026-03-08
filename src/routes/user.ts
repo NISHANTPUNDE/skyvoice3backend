@@ -22,7 +22,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
         }
 
         if (user.isDeleted) {
-            res.status(403).json({ error: 'Account has been deleted. Contact your admin.' });
+            res.status(403).json({ error: 'Your account is deactivated. Please contact your admin.' });
             return;
         }
 

@@ -40,7 +40,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
 // POST /api/superadmin/admins — create admin
 router.post('/admins', authMiddleware(['superadmin']), async (req: Request, res: Response): Promise<void> => {
     try {
-        const { name, username, password } = req.body;
+        const { name, username, password, userLimit } = req.body;
         if (!name || !username || !password) {
             res.status(400).json({ error: 'name, username, and password are required' });
             return;
@@ -60,6 +60,7 @@ router.post('/admins', authMiddleware(['superadmin']), async (req: Request, res:
             passwordHash,
             encryptedPassword: encPwd,
             createdBy: req.auth!.id,
+            userLimit: userLimit || 0,
         });
 
         res.status(201).json({
@@ -67,6 +68,7 @@ router.post('/admins', authMiddleware(['superadmin']), async (req: Request, res:
             name: admin.name,
             username: admin.username,
             isActive: admin.isActive,
+            userLimit: admin.userLimit,
             createdAt: (admin as any).createdAt,
         });
     } catch (err) {
@@ -105,7 +107,7 @@ router.get('/admins', authMiddleware(['superadmin']), async (req: Request, res: 
 // PUT /api/superadmin/admins/:id — update admin
 router.put('/admins/:id', authMiddleware(['superadmin']), async (req: Request, res: Response): Promise<void> => {
     try {
-        const { name, username, password } = req.body;
+        const { name, username, password, userLimit } = req.body;
         const update: any = {};
         if (name) update.name = name;
         if (username) {
@@ -120,6 +122,7 @@ router.put('/admins/:id', authMiddleware(['superadmin']), async (req: Request, r
             update.passwordHash = await bcrypt.hash(password, 10);
             update.encryptedPassword = encryptPassword(password);
         }
+        if (userLimit !== undefined) update.userLimit = userLimit;
 
         const admin = await Admin.findByIdAndUpdate(req.params.id, update, { new: true, projection: '-passwordHash' });
         if (!admin) {
