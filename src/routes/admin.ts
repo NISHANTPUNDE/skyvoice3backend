@@ -59,9 +59,9 @@ router.post('/users', authMiddleware(['admin']), async (req: Request, res: Respo
             return;
         }
 
-        // Check user limit
+        // Check user limit (0 = unlimited)
         const admin = await Admin.findById(req.auth!.id);
-        if (admin && admin.userLimit !== undefined && admin.userLimit !== null) {
+        if (admin && admin.userLimit > 0) {
             const currentCount = await User.countDocuments({ adminId: req.auth!.id, isDeleted: { $ne: true } });
             if (currentCount >= admin.userLimit) {
                 res.status(403).json({ error: `User limit reached (${admin.userLimit}). Contact Super Admin to increase your limit.` });
