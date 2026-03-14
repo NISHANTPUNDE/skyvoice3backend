@@ -14,7 +14,7 @@ export interface IUser extends Document {
 const userSchema = new Schema<IUser>(
     {
         name: { type: String, required: true, trim: true },
-        username: { type: String, required: true, unique: true, lowercase: true, trim: true },
+        username: { type: String, required: true, lowercase: true, trim: true },
         phone: { type: String, default: '', trim: true },
         passwordHash: { type: String, required: true },
         encryptedPassword: { type: String, default: '' },
@@ -24,5 +24,8 @@ const userSchema = new Schema<IUser>(
     },
     { timestamps: true }
 );
+
+// Same username can exist under different admins, but must be unique per admin
+userSchema.index({ username: 1, adminId: 1 }, { unique: true });
 
 export const User = mongoose.model<IUser>('User', userSchema);
