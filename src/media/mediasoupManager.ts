@@ -59,3 +59,15 @@ export async function createWebRtcTransport(
 
     return transport;
 }
+
+export async function createPlainTransport(
+    router: mediasoup.types.Router
+): Promise<mediasoup.types.PlainTransport> {
+    const transport = await router.createPlainTransport({
+        listenIp: config.mediasoup.plainTransport?.listenIp || config.mediasoup.webRtcTransport.listenIps[0] as mediasoup.types.TransportListenIp,
+        rtcpMux: false,
+        comedia: true,
+        enableSrtp: false,
+    });
+    return transport;
+}

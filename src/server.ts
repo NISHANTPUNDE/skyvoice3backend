@@ -3,6 +3,8 @@ import http from 'http';
 import cors from 'cors';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
+import * as fs from 'fs';
+import * as path from 'path';
 
 import { config } from './config';
 import { SuperAdmin } from './models/SuperAdmin';
@@ -12,6 +14,7 @@ import { setupWebSocket } from './ws/wsHandler';
 import superadminRoutes from './routes/superadmin';
 import adminRoutes from './routes/admin';
 import userRoutes from './routes/user';
+import recordingsRoutes from './routes/recordings';
 
 async function main() {
     // Connect to MongoDB
@@ -34,6 +37,13 @@ async function main() {
     // Create mediasoup workers
     await createWorkers();
 
+    // Ensure recordings directory exists
+    const recordingsDir = path.resolve(process.cwd(), 'recordings');
+    if (!fs.existsSync(recordingsDir)) {
+        fs.mkdirSync(recordingsDir, { recursive: true });
+        console.log('Created recordings directory:', recordingsDir);
+    }
+
     // Express app
     const app = express();
     app.use(cors());
@@ -48,6 +58,7 @@ async function main() {
     app.use('/api/superadmin', superadminRoutes);
     app.use('/api/admin', adminRoutes);
     app.use('/api/user', userRoutes);
+    app.use('/api/admin/recordings', recordingsRoutes);
 
     // Create HTTP server
     const httpServer = http.createServer(app);

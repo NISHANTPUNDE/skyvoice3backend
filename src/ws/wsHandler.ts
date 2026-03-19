@@ -5,27 +5,56 @@ import { v4 as uuidv4 } from 'uuid';
 import { config } from '../config';
 import { Room } from '../models/Room';
 import { User } from '../models/User';
-import { createRouter, createWebRtcTransport } from '../media/mediasoupManager';
+import { createRouter, createWebRtcTransport, createPlainTransport } from '../media/mediasoupManager';
 import { AuthPayload } from '../middleware/auth';
 import * as mediasoup from 'mediasoup';
+import { startRecording, stopRecording, RecordingInfo } from '../media/recording';
 
+// ─── Per-user state within a room ───
+interface ListenerState {
+    ws: WebSocket;
+    userName: string;
+    // Consumer side (hearing admin)
+    consumerTransport?: mediasoup.types.WebRtcTransport;
+    consumer?: mediasoup.types.Consumer;
+    // Producer side (speaking via PTT)
+    producerTransport?: mediasoup.types.WebRtcTransport;
+    producer?: mediasoup.types.Producer;
+    isPtt: boolean;
+}
+
+// ─── Admin's consumer for a specific user ───
+interface AdminConsumerEntry {
+    transport: mediasoup.types.WebRtcTransport;
+    consumer: mediasoup.types.Consumer;
+}
+
+// ─── Admin state within a room ───
+interface AdminState {
+    ws: WebSocket;
+    adminName: string;
+    // Producer side (admin speaking)
+    producerTransport?: mediasoup.types.WebRtcTransport;
+    producer?: mediasoup.types.Producer;
+    // Consumers for each user (admin hearing users)
+    consumers: Map<string, AdminConsumerEntry>;
+}
+
+// ─── Room state ───
 interface RoomState {
     router: mediasoup.types.Router;
-    adminProducerTransport?: mediasoup.types.WebRtcTransport;
-    adminProducer?: mediasoup.types.Producer;
-    adminWs?: WebSocket;
-    listeners: Map<
-        string,
-        {
-            ws: WebSocket;
-            transport?: mediasoup.types.WebRtcTransport;
-            consumer?: mediasoup.types.Consumer;
-            userName: string;
-        }
-    >;
+    creatorAdminId: string;
+    // Multiple admins support
+    admins: Map<string, AdminState>;
+    // Listeners (users)
+    listeners: Map<string, ListenerState>;
+    // Grace period timer for admin reconnect
+    adminDisconnectTimer?: ReturnType<typeof setTimeout>;
 }
 
 const rooms = new Map<string, RoomState>();
+const ADMIN_GRACE_PERIOD_MS = 15_000; // 15s grace period for admin reconnect
+const MIN_PTT_DURATION_MS = 500;      // Minimum PTT duration for valid recording
 
 function sendJson(ws: WebSocket, data: any) {
     try {
@@ -40,11 +69,13 @@ function sendJson(ws: WebSocket, data: any) {
 function broadcastToRoom(roomId: string, data: any, excludeWs?: WebSocket) {
     const room = rooms.get(roomId);
     if (!room) return;
-    // Send to admin
-    if (room.adminWs && room.adminWs !== excludeWs) {
-        sendJson(room.adminWs, data);
+    // Broadcast to all admins
+    for (const [, admin] of room.admins) {
+        if (admin.ws !== excludeWs) {
+            sendJson(admin.ws, data);
+        }
     }
-    // Send to listeners
+    // Broadcast to all listeners
     for (const [, listener] of room.listeners) {
         if (listener.ws !== excludeWs) {
             sendJson(listener.ws, data);
@@ -52,26 +83,36 @@ function broadcastToRoom(roomId: string, data: any, excludeWs?: WebSocket) {
     }
 }
 
-function getListenersList(roomId: string): { userId: string; userName: string }[] {
+function broadcastToAdmins(roomId: string, data: any, excludeWs?: WebSocket) {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    for (const [, admin] of room.admins) {
+        if (admin.ws !== excludeWs) {
+            sendJson(admin.ws, data);
+        }
+    }
+}
+
+function getListenersList(roomId: string): { userId: string; userName: string; isPtt: boolean }[] {
     const room = rooms.get(roomId);
     if (!room) return [];
     return Array.from(room.listeners.entries()).map(([userId, l]) => ({
         userId,
         userName: l.userName,
+        isPtt: l.isPtt,
     }));
 }
 
 export function setupWebSocket(httpServer: HttpServer): void {
     const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
-    // ─── Keepalive: ping all clients every 30s, kill dead ones ───
+    // ─── Keepalive: ping all clients every 30s ───
     const PING_INTERVAL = 30_000;
     const aliveMap = new WeakMap<WebSocket, boolean>();
 
     const keepaliveTimer = setInterval(() => {
         wss.clients.forEach((ws) => {
             if (aliveMap.get(ws) === false) {
-                // Didn't respond to last ping — terminate
                 console.log('WS keepalive: terminating unresponsive client');
                 ws.terminate();
                 return;
@@ -84,11 +125,9 @@ export function setupWebSocket(httpServer: HttpServer): void {
     wss.on('close', () => clearInterval(keepaliveTimer));
 
     wss.on('connection', (ws: WebSocket, req) => {
-        // Mark alive on connect and on every pong
         aliveMap.set(ws, true);
         ws.on('pong', () => aliveMap.set(ws, true));
 
-        // Authenticate via query param: ?token=xxx
         const url = new URL(req.url || '', `http://${req.headers.host}`);
         const token = url.searchParams.get('token');
 
@@ -127,22 +166,80 @@ export function setupWebSocket(httpServer: HttpServer): void {
 
 async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
     switch (msg.type) {
+
+        // ══════════════════════════════════════════
+        //  ROOM LIFECYCLE
+        // ══════════════════════════════════════════
+
         case 'create-room': {
             if (auth.role !== 'admin') {
                 sendJson(ws, { type: 'error', message: 'Only admins can create rooms' });
                 return;
             }
 
+            const admin = await import('../models/Admin').then(m => m.Admin.findById(auth.id));
+            if (!admin) {
+                sendJson(ws, { type: 'error', message: 'Admin not found' });
+                return;
+            }
+
+            // Check if admin already has an active room (reconnect after refresh)
+            for (const [existingRoomId, existingRoom] of rooms) {
+                if (existingRoom.creatorAdminId === auth.id) {
+                    // Cancel grace period timer if active
+                    if (existingRoom.adminDisconnectTimer) {
+                        clearTimeout(existingRoom.adminDisconnectTimer);
+                        existingRoom.adminDisconnectTimer = undefined;
+                        console.log(`Admin ${auth.id} reconnected to room ${existingRoomId} (grace period cancelled)`);
+                    }
+                    // Reattach admin WS to existing room
+                    const existingAdmin = existingRoom.admins.get(auth.id);
+                    if (existingAdmin) {
+                        existingAdmin.ws = ws;
+                        // Clean old media (admin needs to re-setup producer)
+                        try { existingAdmin.producer?.close(); } catch { /* ok */ }
+                        try { existingAdmin.producerTransport?.close(); } catch { /* ok */ }
+                        existingAdmin.producer = undefined;
+                        existingAdmin.producerTransport = undefined;
+                    } else {
+                        existingRoom.admins.set(auth.id, {
+                            ws,
+                            adminName: admin.name,
+                            consumers: new Map(),
+                        });
+                    }
+                    sendJson(ws, {
+                        type: 'room-created',
+                        roomId: existingRoomId,
+                        rtpCapabilities: existingRoom.router.rtpCapabilities,
+                    });
+                    // Send current listeners list
+                    sendJson(ws, {
+                        type: 'listener-joined',
+                        listeners: getListenersList(existingRoomId),
+                    });
+                    return;
+                }
+            }
+
             const roomId = uuidv4();
             const router = await createRouter();
             const roomState: RoomState = {
                 router,
-                adminWs: ws,
+                creatorAdminId: auth.id,
+                admins: new Map(),
                 listeners: new Map(),
             };
+            
+            // Add creator as first admin
+            roomState.admins.set(auth.id, {
+                ws,
+                adminName: admin.name,
+                consumers: new Map(),
+            });
+            
             rooms.set(roomId, roomState);
 
-            // Save to DB
             await Room.create({ adminId: auth.id, roomId, isActive: true });
 
             sendJson(ws, {
@@ -166,9 +263,13 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             break;
         }
 
+        // ══════════════════════════════════════════
+        //  PRODUCER TRANSPORT (Admin + User)
+        // ══════════════════════════════════════════
+
         case 'create-producer-transport': {
-            if (auth.role !== 'admin') {
-                sendJson(ws, { type: 'error', message: 'Only admins can produce audio' });
+            if (auth.role !== 'admin' && auth.role !== 'user') {
+                sendJson(ws, { type: 'error', message: 'Invalid role' });
                 return;
             }
             const room = rooms.get(msg.roomId);
@@ -178,7 +279,18 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             }
 
             const transport = await createWebRtcTransport(room.router);
-            room.adminProducerTransport = transport;
+
+            if (auth.role === 'admin') {
+                const admin = room.admins.get(auth.id);
+                if (admin) {
+                    admin.producerTransport = transport;
+                }
+            } else {
+                const listener = room.listeners.get(auth.id);
+                if (listener) {
+                    listener.producerTransport = transport;
+                }
+            }
 
             sendJson(ws, {
                 type: 'producer-transport-created',
@@ -194,30 +306,92 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
 
         case 'connect-producer-transport': {
             const room = rooms.get(msg.roomId);
-            if (!room || !room.adminProducerTransport) {
+            if (!room) {
+                sendJson(ws, { type: 'error', message: 'Room not found' });
+                return;
+            }
+
+            let transport: mediasoup.types.WebRtcTransport | undefined;
+            if (auth.role === 'admin') {
+                transport = room.admins.get(auth.id)?.producerTransport;
+            } else {
+                transport = room.listeners.get(auth.id)?.producerTransport;
+            }
+
+            if (!transport) {
                 sendJson(ws, { type: 'error', message: 'Transport not found' });
                 return;
             }
-            await room.adminProducerTransport.connect({ dtlsParameters: msg.dtlsParameters });
+
+            await transport.connect({ dtlsParameters: msg.dtlsParameters });
             sendJson(ws, { type: 'producer-transport-connected' });
             break;
         }
 
         case 'produce': {
             const room = rooms.get(msg.roomId);
-            if (!room || !room.adminProducerTransport) {
-                sendJson(ws, { type: 'error', message: 'Transport not found' });
+            if (!room) {
+                sendJson(ws, { type: 'error', message: 'Room not found' });
                 return;
             }
-            const producer = await room.adminProducerTransport.produce({
-                kind: msg.kind,
-                rtpParameters: msg.rtpParameters,
-            });
-            room.adminProducer = producer;
 
-            sendJson(ws, { type: 'produced', producerId: producer.id });
+            if (auth.role === 'admin') {
+                // Admin producing — create consumer for all existing users
+                const admin = room.admins.get(auth.id);
+                if (!admin?.producerTransport) {
+                    sendJson(ws, { type: 'error', message: 'Transport not found' });
+                    return;
+                }
+                const producer = await admin.producerTransport.produce({
+                    kind: msg.kind,
+                    rtpParameters: msg.rtpParameters,
+                });
+                admin.producer = producer;
+                sendJson(ws, { type: 'produced', producerId: producer.id });
+                
+                // Notify all users that a new admin producer is available
+                for (const [userId, listener] of room.listeners) {
+                    sendJson(listener.ws, {
+                        type: 'admin-producer-available',
+                        adminId: auth.id,
+                        adminName: admin.adminName,
+                        producerId: producer.id,
+                        roomId: msg.roomId,
+                    });
+                }
+            } else {
+                // User producing — only create consumer for all admins
+                const listener = room.listeners.get(auth.id);
+                if (!listener || !listener.producerTransport) {
+                    sendJson(ws, { type: 'error', message: 'Transport not found' });
+                    return;
+                }
+                const producer = await listener.producerTransport.produce({
+                    kind: msg.kind,
+                    rtpParameters: msg.rtpParameters,
+                    paused: true, // Start paused (PTT off)
+                });
+                listener.producer = producer;
+
+                // Notify all admins that a new user producer is available
+                for (const [adminId, admin] of room.admins) {
+                    sendJson(admin.ws, {
+                        type: 'user-producer-available',
+                        userId: auth.id,
+                        userName: listener.userName,
+                        producerId: producer.id,
+                        roomId: msg.roomId,
+                    });
+                }
+
+                sendJson(ws, { type: 'produced', producerId: producer.id });
+            }
             break;
         }
+
+        // ══════════════════════════════════════════
+        //  JOIN / CONSUMER TRANSPORT (Admin + User)
+        // ══════════════════════════════════════════
 
         case 'join-room': {
             if (auth.role !== 'user') {
@@ -225,7 +399,6 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                 return;
             }
 
-            // Verify user is not deleted
             const user = await User.findById(auth.id);
             if (!user || user.isDeleted) {
                 sendJson(ws, { type: 'error', message: 'Account not active' });
@@ -239,21 +412,62 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                 return;
             }
 
-            room.listeners.set(auth.id, { ws, userName: user.name });
+            // FIX #6 & #7: Clean up existing listener entry (duplicate device / reconnect)
+            const existingListener = room.listeners.get(auth.id);
+            if (existingListener) {
+                console.log(`User ${auth.id} re-joining room ${msg.roomId}, cleaning up old connection`);
+                // Stop recording if PTT was active
+                if (existingListener.isPtt) {
+                    try { await stopRecording(msg.roomId, auth.id); } catch { /* ok */ }
+                }
+                // Close old transports/consumers
+                try { existingListener.consumer?.close(); } catch { /* ok */ }
+                try { existingListener.consumerTransport?.close(); } catch { /* ok */ }
+                try { existingListener.producer?.close(); } catch { /* ok */ }
+                try { existingListener.producerTransport?.close(); } catch { /* ok */ }
+                // Close old WS if different
+                if (existingListener.ws !== ws) {
+                    try { existingListener.ws.close(); } catch { /* ok */ }
+                }
+                // Clean up admin consumers for this user
+                for (const [, admin] of room.admins) {
+                    const entry = admin.consumers.get(auth.id);
+                    if (entry) {
+                        try { entry.consumer?.close(); } catch { /* ok */ }
+                        try { entry.transport?.close(); } catch { /* ok */ }
+                        admin.consumers.delete(auth.id);
+                    }
+                }
+            }
 
-            // Notify admin about new listener
-            broadcastToRoom(msg.roomId, {
+            room.listeners.set(auth.id, {
+                ws,
+                userName: user.name,
+                isPtt: false,
+            });
+
+            // Get list of admin producers
+            const adminProducers = Array.from(room.admins.entries())
+                .filter(([, admin]) => admin.producer)
+                .map(([adminId, admin]) => ({
+                    adminId,
+                    adminName: admin.adminName,
+                    producerId: admin.producer!.id,
+                }));
+
+            // Notify all admins about new listener
+            broadcastToAdmins(msg.roomId, {
                 type: 'listener-joined',
                 userId: auth.id,
                 userName: user.name,
                 listeners: getListenersList(msg.roomId),
-            }, ws);
+            });
 
             sendJson(ws, {
                 type: 'room-joined',
                 roomId: msg.roomId,
                 rtpCapabilities: room.router.rtpCapabilities,
-                hasProducer: !!room.adminProducer,
+                adminProducers,
                 listeners: getListenersList(msg.roomId),
             });
             break;
@@ -267,9 +481,23 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             }
 
             const transport = await createWebRtcTransport(room.router);
-            const listener = room.listeners.get(auth.id);
-            if (listener) {
-                listener.transport = transport;
+
+            if (auth.role === 'user') {
+                // User creates consumer transport to hear all admins
+                const listener = room.listeners.get(auth.id);
+                if (listener) {
+                    listener.consumerTransport = transport;
+                }
+            } else if (auth.role === 'admin') {
+                // Admin creates consumer transport to hear a specific user
+                const userId = msg.userId;
+                const admin = room.admins.get(auth.id);
+                if (userId && admin) {
+                    admin.consumers.set(userId, {
+                        transport,
+                        consumer: undefined as any,
+                    });
+                }
             }
 
             sendJson(ws, {
@@ -280,6 +508,7 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                     iceCandidates: transport.iceCandidates,
                     dtlsParameters: transport.dtlsParameters,
                 },
+                userId: msg.userId, // Echo back for admin to correlate
             });
             break;
         }
@@ -290,75 +519,217 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                 sendJson(ws, { type: 'error', message: 'Room not found' });
                 return;
             }
-            const listener = room.listeners.get(auth.id);
-            if (!listener || !listener.transport) {
+
+            let transport: mediasoup.types.WebRtcTransport | undefined;
+            if (auth.role === 'user') {
+                transport = room.listeners.get(auth.id)?.consumerTransport;
+            } else if (auth.role === 'admin' && msg.userId) {
+                const admin = room.admins.get(auth.id);
+                transport = admin?.consumers.get(msg.userId)?.transport;
+            }
+
+            if (!transport) {
                 sendJson(ws, { type: 'error', message: 'Transport not found' });
                 return;
             }
-            await listener.transport.connect({ dtlsParameters: msg.dtlsParameters });
-            sendJson(ws, { type: 'consumer-transport-connected' });
+            await transport.connect({ dtlsParameters: msg.dtlsParameters });
+            sendJson(ws, { type: 'consumer-transport-connected', userId: msg.userId });
             break;
         }
 
         case 'consume': {
             const room = rooms.get(msg.roomId);
-            if (!room || !room.adminProducer) {
-                sendJson(ws, { type: 'error', message: 'No audio to consume' });
+            if (!room) {
+                sendJson(ws, { type: 'error', message: 'Room not found' });
                 return;
             }
 
-            const listener = room.listeners.get(auth.id);
-            if (!listener || !listener.transport) {
-                sendJson(ws, { type: 'error', message: 'Transport not found' });
-                return;
-            }
-
-            // Check if the router can consume
-            if (
-                !room.router.canConsume({
-                    producerId: room.adminProducer.id,
+            if (auth.role === 'user') {
+                // User consuming an admin's producer
+                const adminId = msg.adminId;
+                if (!adminId) {
+                    sendJson(ws, { type: 'error', message: 'Admin ID required' });
+                    return;
+                }
+                const admin = room.admins.get(adminId);
+                if (!admin?.producer) {
+                    sendJson(ws, { type: 'error', message: 'No audio to consume' });
+                    return;
+                }
+                const listener = room.listeners.get(auth.id);
+                if (!listener?.consumerTransport) {
+                    sendJson(ws, { type: 'error', message: 'Transport not found' });
+                    return;
+                }
+                if (!room.router.canConsume({ producerId: admin.producer.id, rtpCapabilities: msg.rtpCapabilities })) {
+                    sendJson(ws, { type: 'error', message: 'Cannot consume' });
+                    return;
+                }
+                const consumer = await listener.consumerTransport.consume({
+                    producerId: admin.producer.id,
                     rtpCapabilities: msg.rtpCapabilities,
-                })
-            ) {
-                sendJson(ws, { type: 'error', message: 'Cannot consume' });
-                return;
+                    paused: false,
+                });
+                listener.consumer = consumer;
+
+                sendJson(ws, {
+                    type: 'consumed',
+                    params: {
+                        id: consumer.id,
+                        producerId: admin.producer.id,
+                        kind: consumer.kind,
+                        rtpParameters: consumer.rtpParameters,
+                    },
+                    adminId,
+                });
+            } else if (auth.role === 'admin' && msg.userId) {
+                // Admin consuming a user's producer
+                const listener = room.listeners.get(msg.userId);
+                if (!listener?.producer) {
+                    sendJson(ws, { type: 'error', message: 'User has no producer' });
+                    return;
+                }
+                const admin = room.admins.get(auth.id);
+                const adminConsumerEntry = admin?.consumers.get(msg.userId);
+                if (!adminConsumerEntry?.transport) {
+                    sendJson(ws, { type: 'error', message: 'Transport not found' });
+                    return;
+                }
+                if (!room.router.canConsume({ producerId: listener.producer.id, rtpCapabilities: msg.rtpCapabilities })) {
+                    sendJson(ws, { type: 'error', message: 'Cannot consume user audio' });
+                    return;
+                }
+                const consumer = await adminConsumerEntry.transport.consume({
+                    producerId: listener.producer.id,
+                    rtpCapabilities: msg.rtpCapabilities,
+                    paused: false,
+                });
+                adminConsumerEntry.consumer = consumer;
+
+                sendJson(ws, {
+                    type: 'consumed',
+                    params: {
+                        id: consumer.id,
+                        producerId: listener.producer.id,
+                        kind: consumer.kind,
+                        rtpParameters: consumer.rtpParameters,
+                    },
+                    userId: msg.userId,
+                });
             }
-
-            const consumer = await listener.transport.consume({
-                producerId: room.adminProducer.id,
-                rtpCapabilities: msg.rtpCapabilities,
-                paused: false,
-            });
-
-            listener.consumer = consumer;
-
-            sendJson(ws, {
-                type: 'consumed',
-                params: {
-                    id: consumer.id,
-                    producerId: room.adminProducer.id,
-                    kind: consumer.kind,
-                    rtpParameters: consumer.rtpParameters,
-                },
-            });
             break;
         }
 
         case 'resume-consumer': {
             const room = rooms.get(msg.roomId);
             if (!room) return;
-            const listener = room.listeners.get(auth.id);
-            if (listener?.consumer) {
-                await listener.consumer.resume();
-                sendJson(ws, { type: 'consumer-resumed' });
+            if (auth.role === 'user') {
+                const listener = room.listeners.get(auth.id);
+                if (listener?.consumer) {
+                    await listener.consumer.resume();
+                    sendJson(ws, { type: 'consumer-resumed' });
+                }
+            } else if (auth.role === 'admin' && msg.userId) {
+                const admin = room.admins.get(auth.id);
+                const entry = admin?.consumers.get(msg.userId);
+                if (entry?.consumer) {
+                    await entry.consumer.resume();
+                    sendJson(ws, { type: 'consumer-resumed', userId: msg.userId });
+                }
             }
             break;
         }
 
-        case 'leave-room': {
+        // ══════════════════════════════════════════
+        //  PUSH-TO-TALK
+        // ══════════════════════════════════════════
+
+        case 'ptt-start': {
+            if (auth.role !== 'user') return;
             const room = rooms.get(msg.roomId);
             if (!room) return;
 
+            const listener = room.listeners.get(auth.id);
+            if (!listener?.producer) return;
+
+            listener.isPtt = true;
+            (listener as any)._pttStartTime = Date.now();
+
+            // Resume user's producer server-side
+            await listener.producer.resume();
+
+            // Notify all admins
+            broadcastToAdmins(msg.roomId, {
+                type: 'ptt-started',
+                userId: auth.id,
+                userName: listener.userName,
+                roomId: msg.roomId,
+                listeners: getListenersList(msg.roomId),
+            });
+
+            // Start recording for each admin
+            try {
+                await startRecordingForUser(room, msg.roomId, auth.id);
+            } catch (err) {
+                console.error('Failed to start recording:', err);
+            }
+            break;
+        }
+
+        case 'ptt-end': {
+            if (auth.role !== 'user') return;
+            const room = rooms.get(msg.roomId);
+            if (!room) return;
+
+            const listener = room.listeners.get(auth.id);
+            if (!listener?.producer) return;
+
+            listener.isPtt = false;
+
+            // Pause user's producer server-side
+            await listener.producer.pause();
+
+            // Notify all admins
+            broadcastToAdmins(msg.roomId, {
+                type: 'ptt-ended',
+                userId: auth.id,
+                userName: listener.userName,
+                roomId: msg.roomId,
+                listeners: getListenersList(msg.roomId),
+            });
+
+            // FIX #8: Ensure minimum PTT duration for valid recording
+            const pttStartTime = (listener as any)._pttStartTime || 0;
+            const elapsed = Date.now() - pttStartTime;
+            if (elapsed < MIN_PTT_DURATION_MS) {
+                await new Promise(resolve => setTimeout(resolve, MIN_PTT_DURATION_MS - elapsed));
+            }
+
+            // Stop recording
+            try {
+                const recordingInfo = await stopRecording(msg.roomId, auth.id);
+                if (recordingInfo) {
+                    // Notify all admins about saved recording
+                    broadcastToAdmins(msg.roomId, {
+                        type: 'recording-saved',
+                        userId: auth.id,
+                        userName: listener.userName,
+                        recording: recordingInfo,
+                    });
+                }
+            } catch (err) {
+                console.error('Failed to stop recording:', err);
+            }
+            break;
+        }
+
+        // ══════════════════════════════════════════
+        //  ROOM MANAGEMENT
+        // ══════════════════════════════════════════
+
+        case 'leave-room': {
+            const room = rooms.get(msg.roomId);
+            if (!room) return;
             cleanupListener(room, auth.id, msg.roomId);
             sendJson(ws, { type: 'left-room' });
             break;
@@ -376,7 +747,6 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             if (listener) {
                 sendJson(listener.ws, { type: 'kicked', roomId: msg.roomId });
                 cleanupListener(room, msg.userId, msg.roomId);
-                // Close the kicked user's WebSocket
                 try { listener.ws.close(); } catch { /* ignore */ }
             }
             break;
@@ -387,7 +757,6 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                 sendJson(ws, { type: 'error', message: 'Only admins can end rooms' });
                 return;
             }
-
             await endRoom(msg.roomId, ws);
             break;
         }
@@ -397,29 +766,92 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
     }
 }
 
+// ══════════════════════════════════════════
+//  RECORDING HELPERS
+// ══════════════════════════════════════════
+
+async function startRecordingForUser(room: RoomState, roomId: string, userId: string) {
+    // Get first admin producer for recording (or could mix all admins)
+    const firstAdmin = Array.from(room.admins.values()).find(a => a.producer);
+    if (!firstAdmin?.producer) {
+        console.log('No admin producer, skipping recording');
+        return;
+    }
+    const listener = room.listeners.get(userId);
+    if (!listener?.producer) {
+        console.log('No user producer, skipping recording');
+        return;
+    }
+
+    // Create PlainTransports for piping RTP to FFmpeg
+    const userPlainTransport = await createPlainTransport(room.router);
+    const adminPlainTransport = await createPlainTransport(room.router);
+
+    // Create consumers on the PlainTransports
+    const userConsumer = await userPlainTransport.consume({
+        producerId: listener.producer.id,
+        rtpCapabilities: room.router.rtpCapabilities,
+        paused: false,
+    });
+
+    const adminConsumer = await adminPlainTransport.consume({
+        producerId: firstAdmin.producer.id,
+        rtpCapabilities: room.router.rtpCapabilities,
+        paused: false,
+    });
+
+    await startRecording(roomId, userId, {
+        userTransport: userPlainTransport,
+        userConsumer,
+        adminTransport: adminPlainTransport,
+        adminConsumer,
+    });
+}
+
+// ══════════════════════════════════════════
+//  CLEANUP
+// ══════════════════════════════════════════
+
 async function endRoom(roomId: string, adminWs?: WebSocket) {
     const room = rooms.get(roomId);
     if (!room) return;
+
+    // Stop all active recordings
+    for (const [userId, listener] of room.listeners) {
+        if (listener.isPtt) {
+            try { await stopRecording(roomId, userId); } catch { /* ignore */ }
+        }
+    }
 
     // Notify all listeners and close their connections
     for (const [, listener] of room.listeners) {
         sendJson(listener.ws, { type: 'room-ended', roomId });
         try { if (listener.consumer) listener.consumer.close(); } catch { /* ignore */ }
-        try { if (listener.transport) listener.transport.close(); } catch { /* ignore */ }
+        try { if (listener.consumerTransport) listener.consumerTransport.close(); } catch { /* ignore */ }
+        try { if (listener.producer) listener.producer.close(); } catch { /* ignore */ }
+        try { if (listener.producerTransport) listener.producerTransport.close(); } catch { /* ignore */ }
         try { listener.ws.close(); } catch { /* ignore */ }
     }
 
-    // Close admin transport and producer
-    try { if (room.adminProducer) room.adminProducer.close(); } catch { /* ignore */ }
-    try { if (room.adminProducerTransport) room.adminProducerTransport.close(); } catch { /* ignore */ }
+    // Close all admin consumer transports
+    for (const [, admin] of room.admins) {
+        for (const [, entry] of admin.consumers) {
+            try { if (entry.consumer) entry.consumer.close(); } catch { /* ignore */ }
+            try { if (entry.transport) entry.transport.close(); } catch { /* ignore */ }
+        }
+        // Close admin transport and producer
+        try { if (admin.producer) admin.producer.close(); } catch { /* ignore */ }
+        try { if (admin.producerTransport) admin.producerTransport.close(); } catch { /* ignore */ }
+    }
+
     try { room.router.close(); } catch { /* ignore */ }
 
     rooms.delete(roomId);
     await Room.updateOne({ roomId }, { isActive: false }).catch(console.error);
 
-    // Confirm to admin
-    if (adminWs) {
-        sendJson(adminWs, { type: 'room-ended', roomId });
+    // Notify all admins
+    for (const [, admin] of room.admins) {
+        sendJson(admin.ws, { type: 'room-ended', roomId });
     }
 }
 
@@ -427,8 +859,29 @@ function cleanupListener(room: RoomState, userId: string, roomId: string) {
     const listener = room.listeners.get(userId);
     if (!listener) return;
 
+    // Stop recording if PTT is active
+    if (listener.isPtt) {
+        stopRecording(roomId, userId).catch(console.error);
+    }
+
+    // Close user's consumer (hearing admins)
     try { if (listener.consumer) listener.consumer.close(); } catch { /* ignore */ }
-    try { if (listener.transport) listener.transport.close(); } catch { /* ignore */ }
+    try { if (listener.consumerTransport) listener.consumerTransport.close(); } catch { /* ignore */ }
+
+    // Close user's producer (speaking)
+    try { if (listener.producer) listener.producer.close(); } catch { /* ignore */ }
+    try { if (listener.producerTransport) listener.producerTransport.close(); } catch { /* ignore */ }
+
+    // Close all admins' consumers for this user
+    for (const [, admin] of room.admins) {
+        const adminConsumerEntry = admin.consumers.get(userId);
+        if (adminConsumerEntry) {
+            try { if (adminConsumerEntry.consumer) adminConsumerEntry.consumer.close(); } catch { /* ignore */ }
+            try { if (adminConsumerEntry.transport) adminConsumerEntry.transport.close(); } catch { /* ignore */ }
+            admin.consumers.delete(userId);
+        }
+    }
+
     room.listeners.delete(userId);
 
     // Notify everyone about updated listeners list
@@ -440,13 +893,31 @@ function cleanupListener(room: RoomState, userId: string, roomId: string) {
 }
 
 function handleDisconnect(ws: WebSocket, auth: AuthPayload) {
-    // Find all rooms this user is in and clean up
     for (const [roomId, room] of rooms) {
-        if (auth.role === 'admin' && room.adminWs === ws) {
-            // Admin disconnected — end the room
-            endRoom(roomId).catch(console.error);
+        if (auth.role === 'admin') {
+            const admin = room.admins.get(auth.id);
+            if (admin && admin.ws === ws) {
+                if (room.creatorAdminId === auth.id) {
+                    // FIX #3: Grace period — don't end room immediately
+                    // Admin may be refreshing or reconnecting
+                    console.log(`Admin ${auth.id} disconnected from room ${roomId}, starting ${ADMIN_GRACE_PERIOD_MS / 1000}s grace period`);
+                    room.adminDisconnectTimer = setTimeout(() => {
+                        room.adminDisconnectTimer = undefined;
+                        console.log(`Admin ${auth.id} did not reconnect, ending room ${roomId}`);
+                        endRoom(roomId).catch(console.error);
+                    }, ADMIN_GRACE_PERIOD_MS);
+                } else {
+                    // Non-creator admin — remove immediately
+                    for (const [, entry] of admin.consumers) {
+                        try { if (entry.consumer) entry.consumer.close(); } catch { /* ignore */ }
+                        try { if (entry.transport) entry.transport.close(); } catch { /* ignore */ }
+                    }
+                    try { if (admin.producer) admin.producer.close(); } catch { /* ignore */ }
+                    try { if (admin.producerTransport) admin.producerTransport.close(); } catch { /* ignore */ }
+                    room.admins.delete(auth.id);
+                }
+            }
         } else if (auth.role === 'user') {
-            // Check if this user's WS matches the disconnecting one
             const listener = room.listeners.get(auth.id);
             if (listener && listener.ws === ws) {
                 cleanupListener(room, auth.id, roomId);
