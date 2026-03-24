@@ -1,8 +1,11 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
+import * as fs from 'fs';
+import * as path from 'path';
 import { User } from '../models/User';
 import { Room } from '../models/Room';
 import { authMiddleware, generateToken } from '../middleware/auth';
+import { getRecordingFilePath } from '../media/recording';
 
 const router = Router();
 
@@ -101,6 +104,66 @@ router.get('/rooms', authMiddleware(['user']), async (req: Request, res: Respons
         res.json(rooms);
     } catch (err) {
         console.error('User rooms error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
+
+// GET /api/user/recordings — list all recordings for this user across all rooms
+router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const userId = req.auth!.id;
+        const result: Array<{ roomId: string; filename: string; startTime: number; size: number }> = [];
+
+        if (!fs.existsSync(RECORDINGS_DIR)) {
+            res.json([]);
+            return;
+        }
+
+        // Scan all room directories for this user's recordings
+        const roomDirs = fs.readdirSync(RECORDINGS_DIR, { withFileTypes: true }).filter(d => d.isDirectory());
+        for (const roomDir of roomDirs) {
+            const userDir = path.join(RECORDINGS_DIR, roomDir.name, userId);
+            if (!fs.existsSync(userDir)) continue;
+
+            const files = fs.readdirSync(userDir).filter(f => f.endsWith('.webm')).sort().reverse();
+            for (const filename of files) {
+                const filepath = path.join(userDir, filename);
+                const stats = fs.statSync(filepath);
+                result.push({
+                    roomId: roomDir.name,
+                    filename,
+                    startTime: stats.mtimeMs,
+                    size: stats.size,
+                });
+            }
+        }
+
+        // Sort by newest first
+        result.sort((a, b) => b.startTime - a.startTime);
+        res.json(result);
+    } catch (err) {
+        console.error('User recordings error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// GET /api/user/recordings/download/:roomId/:filename — download a recording file
+router.get('/recordings/download/:roomId/:filename', authMiddleware(['user']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const userId = req.auth!.id;
+        const roomId = String(req.params.roomId);
+        const filename = String(req.params.filename);
+
+        const filepath = getRecordingFilePath(roomId, userId, filename);
+        if (!filepath) {
+            res.status(404).json({ error: 'Recording not found' });
+            return;
+        }
+        res.download(filepath, filename);
+    } catch (err) {
+        console.error('User recording download error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });

@@ -416,10 +416,8 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             const existingListener = room.listeners.get(auth.id);
             if (existingListener) {
                 console.log(`User ${auth.id} re-joining room ${msg.roomId}, cleaning up old connection`);
-                // Stop recording if PTT was active
-                if (existingListener.isPtt) {
-                    try { await stopRecording(msg.roomId, auth.id); } catch { /* ok */ }
-                }
+                // Stop any active recording (regardless of isPtt flag — handles race conditions)
+                try { await stopRecording(msg.roomId, auth.id); } catch { /* ok */ }
                 // Close old transports/consumers
                 try { existingListener.consumer?.close(); } catch { /* ok */ }
                 try { existingListener.consumerTransport?.close(); } catch { /* ok */ }
@@ -561,27 +559,43 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                     sendJson(ws, { type: 'error', message: 'Transport not found' });
                     return;
                 }
-                if (!room.router.canConsume({ producerId: admin.producer.id, rtpCapabilities: msg.rtpCapabilities })) {
-                    sendJson(ws, { type: 'error', message: 'Cannot consume' });
+                
+                // Validate RTP capabilities
+                if (!msg.rtpCapabilities) {
+                    sendJson(ws, { type: 'error', message: 'RTP capabilities required' });
                     return;
                 }
-                const consumer = await listener.consumerTransport.consume({
-                    producerId: admin.producer.id,
-                    rtpCapabilities: msg.rtpCapabilities,
-                    paused: false,
-                });
-                listener.consumer = consumer;
-
-                sendJson(ws, {
-                    type: 'consumed',
-                    params: {
-                        id: consumer.id,
+                
+                if (!room.router.canConsume({ producerId: admin.producer.id, rtpCapabilities: msg.rtpCapabilities })) {
+                    console.error('[CONSUME] Cannot consume - incompatible capabilities');
+                    sendJson(ws, { type: 'error', message: 'Cannot consume - incompatible audio format' });
+                    return;
+                }
+                
+                try {
+                    const consumer = await listener.consumerTransport.consume({
                         producerId: admin.producer.id,
-                        kind: consumer.kind,
-                        rtpParameters: consumer.rtpParameters,
-                    },
-                    adminId,
-                });
+                        rtpCapabilities: msg.rtpCapabilities,
+                        paused: false,
+                    });
+                    listener.consumer = consumer;
+
+                    console.log('[CONSUME] Consumer created for user:', auth.id, 'consumer ID:', consumer.id);
+
+                    sendJson(ws, {
+                        type: 'consumed',
+                        params: {
+                            id: consumer.id,
+                            producerId: admin.producer.id,
+                            kind: consumer.kind,
+                            rtpParameters: consumer.rtpParameters,
+                        },
+                        adminId,
+                    });
+                } catch (err: any) {
+                    console.error('[CONSUME] Error creating consumer:', err.message);
+                    sendJson(ws, { type: 'error', message: 'Failed to create consumer: ' + err.message });
+                }
             } else if (auth.role === 'admin' && msg.userId) {
                 // Admin consuming a user's producer
                 const listener = room.listeners.get(msg.userId);
@@ -599,23 +613,29 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                     sendJson(ws, { type: 'error', message: 'Cannot consume user audio' });
                     return;
                 }
-                const consumer = await adminConsumerEntry.transport.consume({
-                    producerId: listener.producer.id,
-                    rtpCapabilities: msg.rtpCapabilities,
-                    paused: false,
-                });
-                adminConsumerEntry.consumer = consumer;
-
-                sendJson(ws, {
-                    type: 'consumed',
-                    params: {
-                        id: consumer.id,
+                
+                try {
+                    const consumer = await adminConsumerEntry.transport.consume({
                         producerId: listener.producer.id,
-                        kind: consumer.kind,
-                        rtpParameters: consumer.rtpParameters,
-                    },
-                    userId: msg.userId,
-                });
+                        rtpCapabilities: msg.rtpCapabilities,
+                        paused: false,
+                    });
+                    adminConsumerEntry.consumer = consumer;
+
+                    sendJson(ws, {
+                        type: 'consumed',
+                        params: {
+                            id: consumer.id,
+                            producerId: listener.producer.id,
+                            kind: consumer.kind,
+                            rtpParameters: consumer.rtpParameters,
+                        },
+                        userId: msg.userId,
+                    });
+                } catch (err: any) {
+                    console.error('[CONSUME] Error creating admin consumer:', err.message);
+                    sendJson(ws, { type: 'error', message: 'Failed to create consumer: ' + err.message });
+                }
             }
             break;
         }
@@ -716,6 +736,13 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                         userName: listener.userName,
                         recording: recordingInfo,
                     });
+                    // Also notify the user who made the recording
+                    sendJson(ws, {
+                        type: 'recording-saved',
+                        userId: auth.id,
+                        userName: listener.userName,
+                        recording: recordingInfo,
+                    });
                 }
             } catch (err) {
                 console.error('Failed to stop recording:', err);
@@ -730,7 +757,7 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
         case 'leave-room': {
             const room = rooms.get(msg.roomId);
             if (!room) return;
-            cleanupListener(room, auth.id, msg.roomId);
+            await cleanupListener(room, auth.id, msg.roomId);
             sendJson(ws, { type: 'left-room' });
             break;
         }
@@ -746,7 +773,7 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             const listener = room.listeners.get(msg.userId);
             if (listener) {
                 sendJson(listener.ws, { type: 'kicked', roomId: msg.roomId });
-                cleanupListener(room, msg.userId, msg.roomId);
+                await cleanupListener(room, msg.userId, msg.roomId);
                 try { listener.ws.close(); } catch { /* ignore */ }
             }
             break;
@@ -816,11 +843,9 @@ async function endRoom(roomId: string, adminWs?: WebSocket) {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    // Stop all active recordings
-    for (const [userId, listener] of room.listeners) {
-        if (listener.isPtt) {
-            try { await stopRecording(roomId, userId); } catch { /* ignore */ }
-        }
+    // Stop ALL active recordings (not just isPtt users — handles race conditions)
+    for (const [userId] of room.listeners) {
+        try { await stopRecording(roomId, userId); } catch { /* ignore */ }
     }
 
     // Notify all listeners and close their connections
@@ -855,13 +880,15 @@ async function endRoom(roomId: string, adminWs?: WebSocket) {
     }
 }
 
-function cleanupListener(room: RoomState, userId: string, roomId: string) {
+async function cleanupListener(room: RoomState, userId: string, roomId: string) {
     const listener = room.listeners.get(userId);
     if (!listener) return;
 
-    // Stop recording if PTT is active
-    if (listener.isPtt) {
-        stopRecording(roomId, userId).catch(console.error);
+    // Stop recording — always try regardless of isPtt flag (handles race conditions)
+    try {
+        await stopRecording(roomId, userId);
+    } catch (err) {
+        console.error(`[Cleanup] Error stopping recording for ${userId}:`, err);
     }
 
     // Close user's consumer (hearing admins)
@@ -920,7 +947,7 @@ function handleDisconnect(ws: WebSocket, auth: AuthPayload) {
         } else if (auth.role === 'user') {
             const listener = room.listeners.get(auth.id);
             if (listener && listener.ws === ws) {
-                cleanupListener(room, auth.id, roomId);
+                cleanupListener(room, auth.id, roomId).catch(console.error);
             }
         }
     }

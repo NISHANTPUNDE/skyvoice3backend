@@ -65,8 +65,8 @@ export async function createPlainTransport(
 ): Promise<mediasoup.types.PlainTransport> {
     const transport = await router.createPlainTransport({
         listenIp: config.mediasoup.plainTransport?.listenIp || config.mediasoup.webRtcTransport.listenIps[0] as mediasoup.types.TransportListenIp,
-        rtcpMux: false,
-        comedia: true,
+        rtcpMux: true,
+        comedia: false,
         enableSrtp: false,
     });
     return transport;

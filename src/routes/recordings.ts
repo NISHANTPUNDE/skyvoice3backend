@@ -6,6 +6,40 @@ import { getRecordingsForRoom, getRecordingFilePath, getRecordingsDir } from '..
 
 const router = Router();
 
+// GET /api/admin/recordings — list all rooms that have recordings
+router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const recDir = getRecordingsDir();
+        if (!fs.existsSync(recDir)) {
+            res.json([]);
+            return;
+        }
+        const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
+        const rooms = roomDirs.map(d => {
+            const roomPath = path.join(recDir, d.name);
+            const userDirs = fs.readdirSync(roomPath, { withFileTypes: true }).filter(u => u.isDirectory());
+            let totalRecordings = 0;
+            const users: Array<{ userId: string; count: number }> = [];
+            for (const u of userDirs) {
+                const files = fs.readdirSync(path.join(roomPath, u.name)).filter(f => f.endsWith('.webm'));
+                if (files.length > 0) {
+                    totalRecordings += files.length;
+                    users.push({ userId: u.name, count: files.length });
+                }
+            }
+            // Get room directory modification time as a rough creation time
+            const stats = fs.statSync(roomPath);
+            return { roomId: d.name, totalRecordings, users, createdAt: stats.mtimeMs };
+        }).filter(r => r.totalRecordings > 0);
+
+        rooms.sort((a, b) => b.createdAt - a.createdAt);
+        res.json(rooms);
+    } catch (err) {
+        console.error('List all recordings error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 // GET /api/admin/recordings/:roomId — list all recording segments for a room
 router.get('/:roomId', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {

@@ -1,6 +1,7 @@
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as dgram from 'dgram';
 import * as mediasoup from 'mediasoup';
 
 export interface RecordingInfo {
@@ -25,16 +26,13 @@ interface ActiveRecording {
     info: RecordingInfo;
     transports: RecordingTransports;
     sdpFiles: string[];
+    exited: boolean;
 }
 
 // Map: `${roomId}:${userId}` → ActiveRecording
 const activeRecordings = new Map<string, ActiveRecording>();
 
 const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
-
-// Pre-warmed FFmpeg pool for faster startup
-const FFMPEG_POOL_SIZE = 10;
-const ffmpegPool: ChildProcess[] = [];
 
 // Ensure recordings directory exists
 function ensureDir(dirPath: string) {
@@ -43,31 +41,34 @@ function ensureDir(dirPath: string) {
     }
 }
 
-// Pre-warm FFmpeg processes (optional optimization)
-function prewarmFFmpegPool() {
-    // This is optional - FFmpeg spawns fast enough for most use cases
-    // Uncomment if you need absolute minimum latency
-    /*
-    for (let i = 0; i < FFMPEG_POOL_SIZE; i++) {
-        const ffmpeg = spawn('ffmpeg', ['-version'], { stdio: 'ignore' });
-        ffmpeg.on('close', () => {
-            // Process exits immediately after version check
+// Allocate free UDP ports for FFmpeg to listen on
+async function getFreePorts(count: number): Promise<number[]> {
+    const ports: number[] = [];
+    const sockets: dgram.Socket[] = [];
+
+    for (let i = 0; i < count; i++) {
+        const sock = dgram.createSocket('udp4');
+        await new Promise<void>((resolve, reject) => {
+            sock.on('error', reject);
+            sock.bind(0, '127.0.0.1', () => resolve());
         });
+        const addr = sock.address();
+        ports.push(typeof addr === 'string' ? 0 : addr.port);
+        sockets.push(sock);
     }
-    */
+
+    // Close all sockets to free the ports for FFmpeg
+    for (const sock of sockets) {
+        sock.close();
+    }
+
+    return ports;
 }
 
 function generateSdp(
-    transport: mediasoup.types.PlainTransport,
+    ffmpegPort: number,
     consumer: mediasoup.types.Consumer,
 ): string {
-    const tuple = transport.tuple;
-    const ip = (tuple as any).localIp || (tuple as any).ip || '127.0.0.1';
-    const port = (tuple as any).localPort || (tuple as any).port || 0;
-    const rtcpTuple = transport.rtcpTuple;
-    const rtcpPort = rtcpTuple
-        ? ((rtcpTuple as any).localPort || (rtcpTuple as any).port || port + 1)
-        : port + 1;
     const rtpParams = consumer.rtpParameters;
     const codec = rtpParams.codecs[0];
     const payloadType = codec.payloadType;
@@ -79,8 +80,7 @@ function generateSdp(
         's=MediaSoup RTP',
         'c=IN IP4 127.0.0.1',
         't=0 0',
-        `m=audio ${port} RTP/AVP ${payloadType}`,
-        `a=rtcp:${rtcpPort}`,
+        `m=audio ${ffmpegPort} RTP/AVP ${payloadType}`,
         `a=rtpmap:${payloadType} opus/${clockRate}/2`,
         `a=fmtp:${payloadType} minptime=10;useinbandfec=1`,
         '',
@@ -106,15 +106,29 @@ export async function startRecording(
     const filename = `segment_${timestamp}.webm`;
     const filepath = path.join(roomDir, filename);
 
-    // Write SDP files
+    // Allocate free ports for FFmpeg to receive RTP
+    const [userPort, adminPort] = await getFreePorts(2);
+    console.log(`[Recording] Allocated FFmpeg ports: user=${userPort}, admin=${adminPort} for ${key}`);
+
+    // Connect PlainTransports to send RTP to FFmpeg's ports
+    await transports.userTransport.connect({ ip: '127.0.0.1', port: userPort });
+    await transports.adminTransport.connect({ ip: '127.0.0.1', port: adminPort });
+
+    // Small delay to ensure transport connections are established before FFmpeg starts
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // Write SDP files with the FFmpeg ports
     const userSdpPath = path.join(roomDir, `user_${timestamp}.sdp`);
     const adminSdpPath = path.join(roomDir, `admin_${timestamp}.sdp`);
 
-    const userSdp = generateSdp(transports.userTransport, transports.userConsumer);
-    const adminSdp = generateSdp(transports.adminTransport, transports.adminConsumer);
+    const userSdp = generateSdp(userPort, transports.userConsumer);
+    const adminSdp = generateSdp(adminPort, transports.adminConsumer);
 
     fs.writeFileSync(userSdpPath, userSdp);
     fs.writeFileSync(adminSdpPath, adminSdp);
+
+    console.log(`[Recording] User SDP (port ${userPort}):\n${userSdp}`);
+    console.log(`[Recording] Admin SDP (port ${adminPort}):\n${adminSdp}`);
 
     const info: RecordingInfo = {
         filename,
@@ -124,69 +138,72 @@ export async function startRecording(
         startTime: Date.now(),
     };
 
-    // Optimized FFmpeg args for low latency and high concurrency
+    // FFmpeg args for recording
     const ffmpegArgs = [
         // Input 1: User audio
         '-protocol_whitelist', 'file,crypto,udp,rtp',
-        '-analyzeduration', '0',  // Start immediately
-        '-probesize', '32',       // Minimal probing
+        '-analyzeduration', '2000000',
+        '-probesize', '512000',
         '-i', userSdpPath,
-        
+
         // Input 2: Admin audio
         '-protocol_whitelist', 'file,crypto,udp,rtp',
-        '-analyzeduration', '0',
-        '-probesize', '32',
+        '-analyzeduration', '2000000',
+        '-probesize', '512000',
         '-i', adminSdpPath,
-        
-        // Audio mixing with minimal latency
+
+        // Audio mixing
         '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=shortest:dropout_transition=0',
-        
-        // Opus codec optimized for real-time
+
+        // Opus codec
         '-c:a', 'libopus',
-        '-b:a', '64k',            // Good quality, reasonable size
-        '-application', 'voip',   // Optimized for voice
-        '-frame_duration', '20',  // Low latency frame size
-        '-packet_loss', '15',     // Handle packet loss
-        
-        // WebM container with minimal overhead
+        '-b:a', '64k',
+        '-application', 'voip',
+        '-frame_duration', '20',
+        '-packet_loss', '15',
+
+        // WebM container
         '-f', 'webm',
-        '-dash', '1',             // Low latency mode
-        
+        '-dash', '1',
+
         // Output
-        '-y',                     // Overwrite if exists
+        '-y',
         filepath,
     ];
 
     console.log(`[Recording] Starting FFmpeg for ${key}: ${filename}`);
-    
-    // Spawn FFmpeg with optimized settings
+
+    // Spawn FFmpeg
     const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: false,
     });
 
-    // Minimal logging to reduce overhead
+    // Log errors
     let errorBuffer = '';
     ffmpeg.stderr?.on('data', (data: Buffer) => {
         const line = data.toString();
-        // Only log errors, not progress
-        if (line.includes('error') || line.includes('Error')) {
+        if (line.includes('error') || line.includes('Error') || line.includes('bind failed')) {
             errorBuffer += line;
-            if (errorBuffer.length > 1000) {
-                console.error(`[FFmpeg/${userId}] ${errorBuffer.slice(0, 1000)}`);
+            if (errorBuffer.length > 2000) {
+                console.error(`[FFmpeg/${userId}] ${errorBuffer.slice(0, 2000)}`);
                 errorBuffer = '';
             }
         }
     });
 
     ffmpeg.on('close', (code: number | null) => {
+        // Mark as exited so stopRecording doesn't wait forever
+        const rec = activeRecordings.get(key);
+        if (rec) rec.exited = true;
+
         if (code !== 0 && code !== null) {
             console.error(`[Recording] FFmpeg exited for ${key} with code ${code}`);
             if (errorBuffer) {
                 console.error(`[FFmpeg/${userId}] Error: ${errorBuffer}`);
             }
         }
-        // Clean up SDP files immediately
+        // Clean up SDP files
         try { fs.unlinkSync(userSdpPath); } catch { /* ok */ }
         try { fs.unlinkSync(adminSdpPath); } catch { /* ok */ }
     });
@@ -195,11 +212,12 @@ export async function startRecording(
         console.error(`[Recording] FFmpeg error for ${key}:`, err.message);
     });
 
-    activeRecordings.set(key, { 
-        ffmpeg, 
-        info, 
+    activeRecordings.set(key, {
+        ffmpeg,
+        info,
         transports,
-        sdpFiles: [userSdpPath, adminSdpPath]
+        sdpFiles: [userSdpPath, adminSdpPath],
+        exited: false,
     });
 }
 
@@ -227,16 +245,18 @@ export async function stopRecording(
     }
 
     // Wait for FFmpeg to exit (max 3s for faster cleanup)
-    await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-            try { ffmpeg.kill('SIGKILL'); } catch { /* ok */ }
-            resolve();
-        }, 3000);
-        ffmpeg.on('close', () => {
-            clearTimeout(timeout);
-            resolve();
+    if (!recording.exited) {
+        await new Promise<void>((resolve) => {
+            const timeout = setTimeout(() => {
+                try { ffmpeg.kill('SIGKILL'); } catch { /* ok */ }
+                resolve();
+            }, 3000);
+            ffmpeg.on('close', () => {
+                clearTimeout(timeout);
+                resolve();
+            });
         });
-    });
+    }
 
     // Close PlainTransports and consumers immediately
     try { transports.userConsumer.close(); } catch { /* ok */ }
