@@ -284,7 +284,7 @@ export function getRecordingsForRoom(roomId: string): Record<string, RecordingIn
         const userId = dir.name;
         const userDir = path.join(roomDir, userId);
         const files = fs.readdirSync(userDir)
-            .filter(f => f.endsWith('.webm'))
+            .filter(f => f.endsWith('.mp3'))
             .sort();
 
         result[userId] = files.map(filename => {
