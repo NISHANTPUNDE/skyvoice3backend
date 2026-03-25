@@ -54,7 +54,7 @@ interface RoomState {
 
 const rooms = new Map<string, RoomState>();
 const ADMIN_GRACE_PERIOD_MS = 15_000; // 15s grace period for admin reconnect
-const MIN_PTT_DURATION_MS = 500;      // Minimum PTT duration for valid recording
+const MIN_PTT_DURATION_MS = 800;      // Minimum PTT duration for valid recording
 
 function sendJson(ws: WebSocket, data: any) {
     try {

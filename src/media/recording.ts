@@ -103,21 +103,14 @@ export async function startRecording(
     const roomDir = path.join(RECORDINGS_DIR, roomId, userId);
     ensureDir(roomDir);
 
-    const filename = `segment_${timestamp}.webm`;
+    const filename = `segment_${timestamp}.mp3`;
     const filepath = path.join(roomDir, filename);
 
     // Allocate free ports for FFmpeg to receive RTP
     const [userPort, adminPort] = await getFreePorts(2);
     console.log(`[Recording] Allocated FFmpeg ports: user=${userPort}, admin=${adminPort} for ${key}`);
 
-    // Connect PlainTransports to send RTP to FFmpeg's ports
-    await transports.userTransport.connect({ ip: '127.0.0.1', port: userPort });
-    await transports.adminTransport.connect({ ip: '127.0.0.1', port: adminPort });
-
-    // Small delay to ensure transport connections are established before FFmpeg starts
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    // Write SDP files with the FFmpeg ports
+    // Step 1: Write SDP files FIRST (FFmpeg needs them to know which ports to bind)
     const userSdpPath = path.join(roomDir, `user_${timestamp}.sdp`);
     const adminSdpPath = path.join(roomDir, `admin_${timestamp}.sdp`);
 
@@ -127,9 +120,6 @@ export async function startRecording(
     fs.writeFileSync(userSdpPath, userSdp);
     fs.writeFileSync(adminSdpPath, adminSdp);
 
-    console.log(`[Recording] User SDP (port ${userPort}):\n${userSdp}`);
-    console.log(`[Recording] Admin SDP (port ${adminPort}):\n${adminSdp}`);
-
     const info: RecordingInfo = {
         filename,
         filepath,
@@ -138,33 +128,22 @@ export async function startRecording(
         startTime: Date.now(),
     };
 
-    // FFmpeg args for recording
+    // FFmpeg args — use single-input user-only recording for reliability
+    // This avoids the amix issue where FFmpeg waits for BOTH streams
     const ffmpegArgs = [
-        // Input 1: User audio
+        // Input: User audio only (the PTT speaker)
         '-protocol_whitelist', 'file,crypto,udp,rtp',
-        '-analyzeduration', '2000000',
-        '-probesize', '512000',
+        '-analyzeduration', '5000000',
+        '-probesize', '1000000',
+        '-fflags', '+genpts+discardcorrupt',
         '-i', userSdpPath,
 
-        // Input 2: Admin audio
-        '-protocol_whitelist', 'file,crypto,udp,rtp',
-        '-analyzeduration', '2000000',
-        '-probesize', '512000',
-        '-i', adminSdpPath,
-
-        // Audio mixing
-        '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=shortest:dropout_transition=0',
-
-        // Opus codec
-        '-c:a', 'libopus',
+        // MP3 codec for universal mobile playback compatibility
+        '-c:a', 'libmp3lame',
         '-b:a', '64k',
-        '-application', 'voip',
-        '-frame_duration', '20',
-        '-packet_loss', '15',
 
-        // WebM container
-        '-f', 'webm',
-        '-dash', '1',
+        // Container
+        '-f', 'mp3',
 
         // Output
         '-y',
@@ -173,7 +152,7 @@ export async function startRecording(
 
     console.log(`[Recording] Starting FFmpeg for ${key}: ${filename}`);
 
-    // Spawn FFmpeg
+    // Step 2: Start FFmpeg FIRST — let it bind to the ports
     const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: false,
@@ -212,6 +191,16 @@ export async function startRecording(
         console.error(`[Recording] FFmpeg error for ${key}:`, err.message);
     });
 
+    // Step 3: Wait for FFmpeg to start and bind to the UDP ports
+    await new Promise(resolve => setTimeout(resolve, 300));
+
+    // Step 4: NOW connect transports — RTP data flows to ready FFmpeg
+    try {
+        await transports.userTransport.connect({ ip: '127.0.0.1', port: userPort });
+    } catch (err) {
+        console.error(`[Recording] Failed to connect user transport for ${key}:`, err);
+    }
+
     activeRecordings.set(key, {
         ffmpeg,
         info,
@@ -244,13 +233,13 @@ export async function stopRecording(
         try { ffmpeg.kill('SIGTERM'); } catch { /* ok */ }
     }
 
-    // Wait for FFmpeg to exit (max 3s for faster cleanup)
+    // Wait for FFmpeg to exit (max 5s)
     if (!recording.exited) {
         await new Promise<void>((resolve) => {
             const timeout = setTimeout(() => {
                 try { ffmpeg.kill('SIGKILL'); } catch { /* ok */ }
                 resolve();
-            }, 3000);
+            }, 5000);
             ffmpeg.on('close', () => {
                 clearTimeout(timeout);
                 resolve();
@@ -258,7 +247,7 @@ export async function stopRecording(
         });
     }
 
-    // Close PlainTransports and consumers immediately
+    // Close PlainTransports and consumers
     try { transports.userConsumer.close(); } catch { /* ok */ }
     try { transports.adminConsumer.close(); } catch { /* ok */ }
     try { transports.userTransport.close(); } catch { /* ok */ }
@@ -272,18 +261,13 @@ export async function stopRecording(
     info.endTime = Date.now();
     info.duration = info.endTime - info.startTime;
 
-    // Verify file was created
+    // Verify file was created — save ALL recordings regardless of size
     if (!fs.existsSync(info.filepath)) {
         console.warn(`[Recording] File not created: ${info.filepath}`);
         return null;
     }
 
     const stats = fs.statSync(info.filepath);
-    if (stats.size < 100) {
-        console.warn(`[Recording] File too small (${stats.size}B), likely empty: ${info.filepath}`);
-        // Keep the file anyway for debugging
-    }
-
     console.log(`[Recording] Saved: ${info.filename} (${Math.round((info.duration || 0) / 1000)}s, ${Math.round(stats.size / 1024)}KB)`);
     return info;
 }
