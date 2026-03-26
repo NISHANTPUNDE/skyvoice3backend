@@ -133,13 +133,14 @@ export async function startRecording(
     };
 
     const ffmpegArgs = [
-        '-protocol_whitelist', 'file,crypto,udp,rtp,pipe',
+        '-protocol_whitelist', 'file,crypto,data,udp,rtp,pipe',
         '-loglevel', 'warning',
         '-analyzeduration', '1000000',
         '-probesize', '500000',
         '-fflags', '+genpts+discardcorrupt+nobuffer',
         '-thread_queue_size', '512',
         '-i', userSdpPath,
+        '-protocol_whitelist', 'file,crypto,data,udp,rtp,pipe',
         '-thread_queue_size', '512',
         '-i', adminSdpPath,
         '-filter_complex', '[0:a]aresample=async=1:first_pts=0[user];[1:a]aresample=async=1:first_pts=0[admin];[user][admin]amix=inputs=2:duration=longest:dropout_transition=0[mix]',
@@ -194,6 +195,14 @@ export async function startRecording(
         console.error(`[Recording] FFmpeg error for ${key}:`, err.message);
     });
 
+    activeRecordings.set(key, {
+        ffmpeg,
+        info,
+        transports,
+        sdpFiles: [userSdpPath, adminSdpPath],
+        exited: false,
+    });
+
     // Step 3: Wait for FFmpeg to start and bind to the UDP ports
     await new Promise(resolve => setTimeout(resolve, 750));
 
@@ -209,13 +218,6 @@ export async function startRecording(
         console.error(`[Recording] Failed to connect admin transport for ${key}:`, err);
     }
 
-    activeRecordings.set(key, {
-        ffmpeg,
-        info,
-        transports,
-        sdpFiles: [userSdpPath, adminSdpPath],
-        exited: false,
-    });
 }
 
 export async function stopRecording(
