@@ -128,35 +128,19 @@ export async function startRecording(
         startTime: Date.now(),
     };
 
-    const protocolWhitelist = 'file,udp,rtp,pipe,crypto,data';
-
-    // FFmpeg args — record only this user's audio plus the current admin audio
+    // FFmpeg args — use single-input user-only recording for reliability
+    // This avoids the amix issue where FFmpeg waits for BOTH streams
     const ffmpegArgs = [
-        // Input 1: User audio
-        '-protocol_whitelist', protocolWhitelist,
+        // Input: User audio only (the PTT speaker)
+        '-protocol_whitelist', 'file,crypto,udp,rtp',
         '-analyzeduration', '5000000',
         '-probesize', '1000000',
         '-fflags', '+genpts+discardcorrupt',
-        '-thread_queue_size', '512',
         '-i', userSdpPath,
-
-        // Input 2: Admin audio
-        '-protocol_whitelist', protocolWhitelist,
-        '-analyzeduration', '5000000',
-        '-probesize', '1000000',
-        '-fflags', '+genpts+discardcorrupt',
-        '-thread_queue_size', '512',
-        '-i', adminSdpPath,
-
-        // Mix exactly these 2 streams into a single recording
-        '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,volume=2[aout]',
-        '-map', '[aout]',
 
         // MP3 codec for universal mobile playback compatibility
         '-c:a', 'libmp3lame',
         '-b:a', '64k',
-        '-ar', '48000',
-        '-ac', '2',
 
         // Container
         '-f', 'mp3',
@@ -215,12 +199,6 @@ export async function startRecording(
         await transports.userTransport.connect({ ip: '127.0.0.1', port: userPort });
     } catch (err) {
         console.error(`[Recording] Failed to connect user transport for ${key}:`, err);
-    }
-
-    try {
-        await transports.adminTransport.connect({ ip: '127.0.0.1', port: adminPort });
-    } catch (err) {
-        console.error(`[Recording] Failed to connect admin transport for ${key}:`, err);
     }
 
     activeRecordings.set(key, {
@@ -306,7 +284,7 @@ export function getRecordingsForRoom(roomId: string): Record<string, RecordingIn
         const userId = dir.name;
         const userDir = path.join(roomDir, userId);
         const files = fs.readdirSync(userDir)
-            .filter(f => f.endsWith('.mp3'))
+            .filter(f => f.endsWith('.mp3') || f.endsWith('.webm'))
             .sort();
 
         result[userId] = files.map(filename => {
