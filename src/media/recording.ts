@@ -73,6 +73,8 @@ function generateSdp(
     const codec = rtpParams.codecs[0];
     const payloadType = codec.payloadType;
     const clockRate = codec.clockRate;
+    const channels = codec.channels ?? 2;
+    const ssrc = rtpParams.encodings?.[0]?.ssrc;
 
     return [
         'v=0',
@@ -81,8 +83,10 @@ function generateSdp(
         'c=IN IP4 127.0.0.1',
         't=0 0',
         `m=audio ${ffmpegPort} RTP/AVP ${payloadType}`,
-        `a=rtpmap:${payloadType} opus/${clockRate}/2`,
-        `a=fmtp:${payloadType} minptime=10;useinbandfec=1`,
+        'a=recvonly',
+        `a=rtpmap:${payloadType} opus/${clockRate}/${channels}`,
+        `a=fmtp:${payloadType} minptime=10;useinbandfec=1;stereo=${channels > 1 ? 1 : 0}`,
+        ...(ssrc ? [`a=ssrc:${ssrc} cname:skyvoice-recording`] : []),
         '',
     ].join('\r\n');
 }
@@ -128,24 +132,23 @@ export async function startRecording(
         startTime: Date.now(),
     };
 
-    // FFmpeg args — use single-input user-only recording for reliability
-    // This avoids the amix issue where FFmpeg waits for BOTH streams
     const ffmpegArgs = [
-        // Input: User audio only (the PTT speaker)
-        '-protocol_whitelist', 'file,crypto,udp,rtp',
-        '-analyzeduration', '5000000',
-        '-probesize', '1000000',
-        '-fflags', '+genpts+discardcorrupt',
+        '-protocol_whitelist', 'file,crypto,udp,rtp,pipe',
+        '-loglevel', 'warning',
+        '-analyzeduration', '1000000',
+        '-probesize', '500000',
+        '-fflags', '+genpts+discardcorrupt+nobuffer',
+        '-thread_queue_size', '512',
         '-i', userSdpPath,
-
-        // MP3 codec for universal mobile playback compatibility
+        '-thread_queue_size', '512',
+        '-i', adminSdpPath,
+        '-filter_complex', '[0:a]aresample=async=1:first_pts=0[user];[1:a]aresample=async=1:first_pts=0[admin];[user][admin]amix=inputs=2:duration=longest:dropout_transition=0[mix]',
+        '-map', '[mix]',
+        '-ac', '1',
+        '-ar', '16000',
         '-c:a', 'libmp3lame',
-        '-b:a', '64k',
-
-        // Container
+        '-b:a', '24k',
         '-f', 'mp3',
-
-        // Output
         '-y',
         filepath,
     ];
@@ -192,13 +195,18 @@ export async function startRecording(
     });
 
     // Step 3: Wait for FFmpeg to start and bind to the UDP ports
-    await new Promise(resolve => setTimeout(resolve, 300));
+    await new Promise(resolve => setTimeout(resolve, 750));
 
     // Step 4: NOW connect transports — RTP data flows to ready FFmpeg
     try {
         await transports.userTransport.connect({ ip: '127.0.0.1', port: userPort });
     } catch (err) {
         console.error(`[Recording] Failed to connect user transport for ${key}:`, err);
+    }
+    try {
+        await transports.adminTransport.connect({ ip: '127.0.0.1', port: adminPort });
+    } catch (err) {
+        console.error(`[Recording] Failed to connect admin transport for ${key}:`, err);
     }
 
     activeRecordings.set(key, {
@@ -268,6 +276,11 @@ export async function stopRecording(
     }
 
     const stats = fs.statSync(info.filepath);
+    if (stats.size === 0) {
+        console.warn(`[Recording] Empty file saved for ${key}: ${info.filepath}`);
+        try { fs.unlinkSync(info.filepath); } catch { /* ok */ }
+        return null;
+    }
     console.log(`[Recording] Saved: ${info.filename} (${Math.round((info.duration || 0) / 1000)}s, ${Math.round(stats.size / 1024)}KB)`);
     return info;
 }
