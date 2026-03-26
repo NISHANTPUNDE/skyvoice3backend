@@ -73,8 +73,6 @@ function generateSdp(
     const codec = rtpParams.codecs[0];
     const payloadType = codec.payloadType;
     const clockRate = codec.clockRate;
-    const channels = codec.channels ?? 2;
-    const ssrc = rtpParams.encodings?.[0]?.ssrc;
 
     return [
         'v=0',
@@ -83,10 +81,8 @@ function generateSdp(
         'c=IN IP4 127.0.0.1',
         't=0 0',
         `m=audio ${ffmpegPort} RTP/AVP ${payloadType}`,
-        'a=recvonly',
-        `a=rtpmap:${payloadType} opus/${clockRate}/${channels}`,
-        `a=fmtp:${payloadType} minptime=10;useinbandfec=1;stereo=${channels > 1 ? 1 : 0}`,
-        ...(ssrc ? [`a=ssrc:${ssrc} cname:skyvoice-recording`] : []),
+        `a=rtpmap:${payloadType} opus/${clockRate}/2`,
+        `a=fmtp:${payloadType} minptime=10;useinbandfec=1`,
         '',
     ].join('\r\n');
 }
@@ -132,24 +128,40 @@ export async function startRecording(
         startTime: Date.now(),
     };
 
+    const protocolWhitelist = 'file,udp,rtp,pipe,crypto,data';
+
+    // FFmpeg args — record only this user's audio plus the current admin audio
     const ffmpegArgs = [
-        '-protocol_whitelist', 'file,crypto,data,udp,rtp,pipe',
-        '-loglevel', 'warning',
-        '-analyzeduration', '1000000',
-        '-probesize', '500000',
-        '-fflags', '+genpts+discardcorrupt+nobuffer',
+        // Input 1: User audio
+        '-protocol_whitelist', protocolWhitelist,
+        '-analyzeduration', '5000000',
+        '-probesize', '1000000',
+        '-fflags', '+genpts+discardcorrupt',
         '-thread_queue_size', '512',
         '-i', userSdpPath,
-        '-protocol_whitelist', 'file,crypto,data,udp,rtp,pipe',
+
+        // Input 2: Admin audio
+        '-protocol_whitelist', protocolWhitelist,
+        '-analyzeduration', '5000000',
+        '-probesize', '1000000',
+        '-fflags', '+genpts+discardcorrupt',
         '-thread_queue_size', '512',
         '-i', adminSdpPath,
-        '-filter_complex', '[0:a]aresample=async=1:first_pts=0[user];[1:a]aresample=async=1:first_pts=0[admin];[user][admin]amix=inputs=2:duration=longest:dropout_transition=0[mix]',
-        '-map', '[mix]',
-        '-ac', '1',
-        '-ar', '16000',
+
+        // Mix exactly these 2 streams into a single recording
+        '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,volume=2[aout]',
+        '-map', '[aout]',
+
+        // MP3 codec for universal mobile playback compatibility
         '-c:a', 'libmp3lame',
-        '-b:a', '24k',
+        '-b:a', '64k',
+        '-ar', '48000',
+        '-ac', '2',
+
+        // Container
         '-f', 'mp3',
+
+        // Output
         '-y',
         filepath,
     ];
@@ -195,16 +207,8 @@ export async function startRecording(
         console.error(`[Recording] FFmpeg error for ${key}:`, err.message);
     });
 
-    activeRecordings.set(key, {
-        ffmpeg,
-        info,
-        transports,
-        sdpFiles: [userSdpPath, adminSdpPath],
-        exited: false,
-    });
-
     // Step 3: Wait for FFmpeg to start and bind to the UDP ports
-    await new Promise(resolve => setTimeout(resolve, 750));
+    await new Promise(resolve => setTimeout(resolve, 300));
 
     // Step 4: NOW connect transports — RTP data flows to ready FFmpeg
     try {
@@ -212,12 +216,20 @@ export async function startRecording(
     } catch (err) {
         console.error(`[Recording] Failed to connect user transport for ${key}:`, err);
     }
+
     try {
         await transports.adminTransport.connect({ ip: '127.0.0.1', port: adminPort });
     } catch (err) {
         console.error(`[Recording] Failed to connect admin transport for ${key}:`, err);
     }
 
+    activeRecordings.set(key, {
+        ffmpeg,
+        info,
+        transports,
+        sdpFiles: [userSdpPath, adminSdpPath],
+        exited: false,
+    });
 }
 
 export async function stopRecording(
@@ -278,11 +290,6 @@ export async function stopRecording(
     }
 
     const stats = fs.statSync(info.filepath);
-    if (stats.size === 0) {
-        console.warn(`[Recording] Empty file saved for ${key}: ${info.filepath}`);
-        try { fs.unlinkSync(info.filepath); } catch { /* ok */ }
-        return null;
-    }
     console.log(`[Recording] Saved: ${info.filename} (${Math.round((info.duration || 0) / 1000)}s, ${Math.round(stats.size / 1024)}KB)`);
     return info;
 }

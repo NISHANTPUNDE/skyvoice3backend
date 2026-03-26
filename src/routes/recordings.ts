@@ -77,9 +77,7 @@ router.get('/download/:roomId/:userId/:filename', authMiddleware(['admin']), asy
             res.status(404).json({ error: 'Recording not found' });
             return;
         }
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Content-Disposition', `inline; filename="${path.basename(filename).replace(/"/g, '')}"`);
-        res.sendFile(filepath);
+        res.download(filepath, filename);
     } catch (err) {
         console.error('Download recording error:', err);
         res.status(500).json({ error: 'Server error' });
