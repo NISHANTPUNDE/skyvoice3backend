@@ -18,12 +18,14 @@ declare global {
 export function authMiddleware(allowedRoles: AuthPayload['role'][]) {
     return (req: Request, res: Response, next: NextFunction): void => {
         const header = req.headers.authorization;
-        if (!header || !header.startsWith('Bearer ')) {
+        const queryToken = typeof req.query.token === 'string' ? req.query.token : undefined;
+        const token = header?.startsWith('Bearer ') ? header.split(' ')[1] : queryToken;
+
+        if (!token) {
             res.status(401).json({ error: 'No token provided' });
             return;
         }
 
-        const token = header.split(' ')[1];
         try {
             const decoded = jwt.verify(token, config.jwtSecret) as AuthPayload;
             if (!allowedRoles.includes(decoded.role)) {
