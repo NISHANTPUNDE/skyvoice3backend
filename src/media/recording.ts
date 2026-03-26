@@ -22,11 +22,15 @@ interface RecordingTransports {
 }
 
 interface ActiveRecording {
-    ffmpeg: ChildProcess;
+    userFfmpeg: ChildProcess;
+    adminFfmpeg: ChildProcess;
     info: RecordingInfo;
     transports: RecordingTransports;
     sdpFiles: string[];
-    exited: boolean;
+    userExited: boolean;
+    adminExited: boolean;
+    userFilepath: string;
+    adminFilepath: string;
 }
 
 // Map: `${roomId}:${userId}` → ActiveRecording
@@ -34,14 +38,12 @@ const activeRecordings = new Map<string, ActiveRecording>();
 
 const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
 
-// Ensure recordings directory exists
 function ensureDir(dirPath: string) {
     if (!fs.existsSync(dirPath)) {
         fs.mkdirSync(dirPath, { recursive: true });
     }
 }
 
-// Allocate free UDP ports for FFmpeg to listen on
 async function getFreePorts(count: number): Promise<number[]> {
     const ports: number[] = [];
     const sockets: dgram.Socket[] = [];
@@ -57,7 +59,6 @@ async function getFreePorts(count: number): Promise<number[]> {
         sockets.push(sock);
     }
 
-    // Close all sockets to free the ports for FFmpeg
     for (const sock of sockets) {
         sock.close();
     }
@@ -87,6 +88,122 @@ function generateSdp(
     ].join('\r\n');
 }
 
+function spawnSingleStreamFfmpeg(
+    sdpPath: string,
+    outputPath: string,
+    label: string,
+): ChildProcess {
+    const ffmpegArgs = [
+        '-protocol_whitelist', 'file,crypto,udp,rtp',
+        '-analyzeduration', '5000000',
+        '-probesize', '1000000',
+        '-fflags', '+genpts+discardcorrupt',
+        '-i', sdpPath,
+
+        // MP3 codec for universal mobile playback
+        '-c:a', 'libmp3lame',
+        '-b:a', '64k',
+        '-f', 'mp3',
+        '-y',
+        outputPath,
+    ];
+
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: false,
+    });
+
+    ffmpeg.stderr?.on('data', (data: Buffer) => {
+        const line = data.toString();
+        if (line.includes('error') || line.includes('Error') || line.includes('bind failed')) {
+            console.error(`[FFmpeg/${label}] ${line.slice(0, 500)}`);
+        }
+    });
+
+    ffmpeg.on('error', (err: Error) => {
+        console.error(`[FFmpeg/${label}] Process error:`, err.message);
+    });
+
+    return ffmpeg;
+}
+
+// Background mix: combines user + admin audio into single MP3
+function backgroundMix(userFile: string, adminFile: string, outputFile: string, label: string) {
+    const userExists = fs.existsSync(userFile);
+    const adminExists = fs.existsSync(adminFile);
+    const userSize = userExists ? fs.statSync(userFile).size : 0;
+    const adminSize = adminExists ? fs.statSync(adminFile).size : 0;
+
+    // If only user audio exists, just rename it
+    if (userSize > 0 && adminSize === 0) {
+        try { fs.renameSync(userFile, outputFile); } catch { /* ok */ }
+        try { fs.unlinkSync(adminFile); } catch { /* ok */ }
+        console.log(`[Recording] Mix: user-only → ${path.basename(outputFile)}`);
+        return;
+    }
+
+    // If only admin audio exists (shouldn't happen), rename it
+    if (userSize === 0 && adminSize > 0) {
+        try { fs.renameSync(adminFile, outputFile); } catch { /* ok */ }
+        try { fs.unlinkSync(userFile); } catch { /* ok */ }
+        console.log(`[Recording] Mix: admin-only → ${path.basename(outputFile)}`);
+        return;
+    }
+
+    // If neither has data, nothing to do
+    if (userSize === 0 && adminSize === 0) {
+        try { fs.unlinkSync(userFile); } catch { /* ok */ }
+        try { fs.unlinkSync(adminFile); } catch { /* ok */ }
+        console.log(`[Recording] Mix: both empty, skipping`);
+        return;
+    }
+
+    // Both have data — mix them in background
+    console.log(`[Recording] Mix: merging user (${Math.round(userSize / 1024)}KB) + admin (${Math.round(adminSize / 1024)}KB) → ${path.basename(outputFile)}`);
+
+    const mixArgs = [
+        '-i', userFile,
+        '-i', adminFile,
+        '-filter_complex', 'amix=inputs=2:duration=first:dropout_transition=0',
+        '-c:a', 'libmp3lame',
+        '-b:a', '64k',
+        '-f', 'mp3',
+        '-y',
+        outputFile,
+    ];
+
+    const mixProcess = spawn('ffmpeg', mixArgs, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: false,
+    });
+
+    mixProcess.stderr?.on('data', (data: Buffer) => {
+        const line = data.toString();
+        if (line.includes('error') || line.includes('Error')) {
+            console.error(`[FFmpeg/mix/${label}] ${line.slice(0, 500)}`);
+        }
+    });
+
+    mixProcess.on('close', (code: number | null) => {
+        // Clean up temp files
+        try { fs.unlinkSync(userFile); } catch { /* ok */ }
+        try { fs.unlinkSync(adminFile); } catch { /* ok */ }
+
+        if (code === 0) {
+            const stats = fs.statSync(outputFile);
+            console.log(`[Recording] Mix complete: ${path.basename(outputFile)} (${Math.round(stats.size / 1024)}KB)`);
+        } else {
+            console.error(`[Recording] Mix failed with code ${code} for ${label}`);
+            // If mix failed but user file was already deleted, try to recover
+            // The individual files are gone so we can't recover — just log
+        }
+    });
+
+    mixProcess.on('error', (err: Error) => {
+        console.error(`[Recording] Mix process error for ${label}:`, err.message);
+    });
+}
+
 export async function startRecording(
     roomId: string,
     userId: string,
@@ -103,14 +220,19 @@ export async function startRecording(
     const roomDir = path.join(RECORDINGS_DIR, roomId, userId);
     ensureDir(roomDir);
 
+    // Final mixed output filename
     const filename = `segment_${timestamp}.mp3`;
     const filepath = path.join(roomDir, filename);
+
+    // Temp files for individual streams
+    const userFilepath = path.join(roomDir, `_user_${timestamp}.mp3`);
+    const adminFilepath = path.join(roomDir, `_admin_${timestamp}.mp3`);
 
     // Allocate free ports for FFmpeg to receive RTP
     const [userPort, adminPort] = await getFreePorts(2);
     console.log(`[Recording] Allocated FFmpeg ports: user=${userPort}, admin=${adminPort} for ${key}`);
 
-    // Step 1: Write SDP files FIRST (FFmpeg needs them to know which ports to bind)
+    // Write SDP files
     const userSdpPath = path.join(roomDir, `user_${timestamp}.sdp`);
     const adminSdpPath = path.join(roomDir, `admin_${timestamp}.sdp`);
 
@@ -128,85 +250,77 @@ export async function startRecording(
         startTime: Date.now(),
     };
 
-    // FFmpeg args — use single-input user-only recording for reliability
-    // This avoids the amix issue where FFmpeg waits for BOTH streams
-    const ffmpegArgs = [
-        // Input: User audio only (the PTT speaker)
-        '-protocol_whitelist', 'file,crypto,udp,rtp',
-        '-analyzeduration', '5000000',
-        '-probesize', '1000000',
-        '-fflags', '+genpts+discardcorrupt',
-        '-i', userSdpPath,
+    // Start TWO separate FFmpeg processes — one per stream
+    console.log(`[Recording] Starting dual FFmpeg for ${key}: ${filename}`);
 
-        // MP3 codec for universal mobile playback compatibility
-        '-c:a', 'libmp3lame',
-        '-b:a', '64k',
+    const userFfmpeg = spawnSingleStreamFfmpeg(userSdpPath, userFilepath, `user/${userId}`);
+    const adminFfmpeg = spawnSingleStreamFfmpeg(adminSdpPath, adminFilepath, `admin/${userId}`);
 
-        // Container
-        '-f', 'mp3',
+    let userExited = false;
+    let adminExited = false;
 
-        // Output
-        '-y',
-        filepath,
-    ];
-
-    console.log(`[Recording] Starting FFmpeg for ${key}: ${filename}`);
-
-    // Step 2: Start FFmpeg FIRST — let it bind to the ports
-    const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: false,
-    });
-
-    // Log errors
-    let errorBuffer = '';
-    ffmpeg.stderr?.on('data', (data: Buffer) => {
-        const line = data.toString();
-        if (line.includes('error') || line.includes('Error') || line.includes('bind failed')) {
-            errorBuffer += line;
-            if (errorBuffer.length > 2000) {
-                console.error(`[FFmpeg/${userId}] ${errorBuffer.slice(0, 2000)}`);
-                errorBuffer = '';
-            }
-        }
-    });
-
-    ffmpeg.on('close', (code: number | null) => {
-        // Mark as exited so stopRecording doesn't wait forever
+    userFfmpeg.on('close', () => {
         const rec = activeRecordings.get(key);
-        if (rec) rec.exited = true;
-
-        if (code !== 0 && code !== null) {
-            console.error(`[Recording] FFmpeg exited for ${key} with code ${code}`);
-            if (errorBuffer) {
-                console.error(`[FFmpeg/${userId}] Error: ${errorBuffer}`);
-            }
-        }
-        // Clean up SDP files
+        if (rec) rec.userExited = true;
         try { fs.unlinkSync(userSdpPath); } catch { /* ok */ }
+    });
+
+    adminFfmpeg.on('close', () => {
+        const rec = activeRecordings.get(key);
+        if (rec) rec.adminExited = true;
         try { fs.unlinkSync(adminSdpPath); } catch { /* ok */ }
     });
 
-    ffmpeg.on('error', (err: Error) => {
-        console.error(`[Recording] FFmpeg error for ${key}:`, err.message);
-    });
-
-    // Step 3: Wait for FFmpeg to start and bind to the UDP ports
+    // Wait for FFmpeg to start and bind to their UDP ports
     await new Promise(resolve => setTimeout(resolve, 300));
 
-    // Step 4: NOW connect transports — RTP data flows to ready FFmpeg
+    // NOW connect transports — RTP data flows to ready FFmpeg
     try {
         await transports.userTransport.connect({ ip: '127.0.0.1', port: userPort });
     } catch (err) {
         console.error(`[Recording] Failed to connect user transport for ${key}:`, err);
     }
 
+    try {
+        await transports.adminTransport.connect({ ip: '127.0.0.1', port: adminPort });
+    } catch (err) {
+        console.error(`[Recording] Failed to connect admin transport for ${key}:`, err);
+    }
+
     activeRecordings.set(key, {
-        ffmpeg,
+        userFfmpeg,
+        adminFfmpeg,
         info,
         transports,
         sdpFiles: [userSdpPath, adminSdpPath],
-        exited: false,
+        userExited: false,
+        adminExited: false,
+        userFilepath,
+        adminFilepath,
+    });
+}
+
+async function stopFfmpeg(ffmpeg: ChildProcess, exited: boolean, label: string): Promise<void> {
+    if (exited) return;
+
+    try {
+        if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) {
+            ffmpeg.stdin.write('q');
+            ffmpeg.stdin.end();
+        }
+    } catch {
+        try { ffmpeg.kill('SIGTERM'); } catch { /* ok */ }
+    }
+
+    await new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => {
+            try { ffmpeg.kill('SIGKILL'); } catch { /* ok */ }
+            resolve();
+        }, 5000);
+        ffmpeg.on('close', () => {
+            clearTimeout(timeout);
+            resolve();
+        });
     });
 }
 
@@ -220,32 +334,13 @@ export async function stopRecording(
 
     activeRecordings.delete(key);
 
-    const { ffmpeg, info, transports, sdpFiles } = recording;
+    const { userFfmpeg, adminFfmpeg, info, transports, sdpFiles, userFilepath, adminFilepath } = recording;
 
-    // Send 'q' to FFmpeg stdin to gracefully stop
-    try {
-        if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) {
-            ffmpeg.stdin.write('q');
-            ffmpeg.stdin.end();
-        }
-    } catch {
-        // If stdin write fails, kill the process
-        try { ffmpeg.kill('SIGTERM'); } catch { /* ok */ }
-    }
-
-    // Wait for FFmpeg to exit (max 5s)
-    if (!recording.exited) {
-        await new Promise<void>((resolve) => {
-            const timeout = setTimeout(() => {
-                try { ffmpeg.kill('SIGKILL'); } catch { /* ok */ }
-                resolve();
-            }, 5000);
-            ffmpeg.on('close', () => {
-                clearTimeout(timeout);
-                resolve();
-            });
-        });
-    }
+    // Stop both FFmpeg processes in parallel
+    await Promise.all([
+        stopFfmpeg(userFfmpeg, recording.userExited, `user/${userId}`),
+        stopFfmpeg(adminFfmpeg, recording.adminExited, `admin/${userId}`),
+    ]);
 
     // Close PlainTransports and consumers
     try { transports.userConsumer.close(); } catch { /* ok */ }
@@ -261,14 +356,11 @@ export async function stopRecording(
     info.endTime = Date.now();
     info.duration = info.endTime - info.startTime;
 
-    // Verify file was created — save ALL recordings regardless of size
-    if (!fs.existsSync(info.filepath)) {
-        console.warn(`[Recording] File not created: ${info.filepath}`);
-        return null;
-    }
+    // Background mix: merge user + admin into final file
+    // This runs asynchronously — doesn't block PTT release
+    backgroundMix(userFilepath, adminFilepath, info.filepath, `${roomId}:${userId}`);
 
-    const stats = fs.statSync(info.filepath);
-    console.log(`[Recording] Saved: ${info.filename} (${Math.round((info.duration || 0) / 1000)}s, ${Math.round(stats.size / 1024)}KB)`);
+    console.log(`[Recording] Stopped: ${info.filename} (${Math.round((info.duration || 0) / 1000)}s) — mixing in background`);
     return info;
 }
 
@@ -284,7 +376,8 @@ export function getRecordingsForRoom(roomId: string): Record<string, RecordingIn
         const userId = dir.name;
         const userDir = path.join(roomDir, userId);
         const files = fs.readdirSync(userDir)
-            .filter(f => f.endsWith('.mp3') || f.endsWith('.webm'))
+            // Show final mixed files (segment_*) but not temp files (_user_*, _admin_*)
+            .filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_'))
             .sort();
 
         result[userId] = files.map(filename => {

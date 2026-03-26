@@ -127,7 +127,7 @@ router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Re
             const userDir = path.join(RECORDINGS_DIR, roomDir.name, userId);
             if (!fs.existsSync(userDir)) continue;
 
-            const files = fs.readdirSync(userDir).filter(f => f.endsWith('.mp3') || f.endsWith('.webm')).sort().reverse();
+            const files = fs.readdirSync(userDir).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_')).sort().reverse();
             for (const filename of files) {
                 const filepath = path.join(userDir, filename);
                 const stats = fs.statSync(filepath);

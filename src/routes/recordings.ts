@@ -21,7 +21,7 @@ router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): 
             let totalRecordings = 0;
             const users: Array<{ userId: string; count: number }> = [];
             for (const u of userDirs) {
-                const files = fs.readdirSync(path.join(roomPath, u.name)).filter(f => f.endsWith('.mp3') || f.endsWith('.webm'));
+                const files = fs.readdirSync(path.join(roomPath, u.name)).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_'));
                 if (files.length > 0) {
                     totalRecordings += files.length;
                     users.push({ userId: u.name, count: files.length });
