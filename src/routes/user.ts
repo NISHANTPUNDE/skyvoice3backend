@@ -6,6 +6,7 @@ import { User } from '../models/User';
 import { Room } from '../models/Room';
 import { authMiddleware, generateToken } from '../middleware/auth';
 import { getRecordingFilePath } from '../media/recording';
+import { isRoomActive } from '../ws/wsHandler';
 
 const router = Router();
 
@@ -100,8 +101,12 @@ router.get('/rooms', authMiddleware(['user']), async (req: Request, res: Respons
             return;
         }
 
-        const rooms = await Room.find({ adminId: user.adminId, isActive: true }).populate('adminId', 'name');
-        res.json(rooms);
+        const dbRooms = await Room.find({ adminId: user.adminId, isActive: true }).populate('adminId', 'name');
+        
+        // Filter out stale rooms (e.g., if server restarted while room was active)
+        const activeRooms = dbRooms.filter(r => isRoomActive(r.roomId));
+        
+        res.json(activeRooms);
     } catch (err) {
         console.error('User rooms error:', err);
         res.status(500).json({ error: 'Server error' });

@@ -41,18 +41,45 @@ interface AdminState {
 }
 
 // ─── Room state ───
+// ══════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════
+
 interface RoomState {
     router: mediasoup.types.Router;
     creatorAdminId: string;
-    // Multiple admins support
-    admins: Map<string, AdminState>;
-    // Listeners (users)
-    listeners: Map<string, ListenerState>;
-    // Grace period timer for admin reconnect
-    adminDisconnectTimer?: ReturnType<typeof setTimeout>;
+    adminDisconnectTimer?: NodeJS.Timeout;
+    admins: Map<string, { // adminId -> AdminConnection
+        ws: WebSocket;
+        adminName: string;
+        producer?: mediasoup.types.Producer;
+        producerTransport?: mediasoup.types.WebRtcTransport;
+        consumers: Map<string, { // userId -> admin's consumer for that user
+            consumer?: mediasoup.types.Consumer;
+            transport?: mediasoup.types.WebRtcTransport;
+        }>;
+    }>;
+    listeners: Map<string, {
+        ws: WebSocket;
+        userName: string;
+        isPtt: boolean;
+        producer?: mediasoup.types.Producer;
+        producerTransport?: mediasoup.types.WebRtcTransport;
+        consumer?: mediasoup.types.Consumer;         // consumes active admin
+        consumerTransport?: mediasoup.types.WebRtcTransport;
+    }>;
 }
 
 const rooms = new Map<string, RoomState>();
+
+export function getActiveRoomIds(): string[] {
+    return Array.from(rooms.keys());
+}
+
+export function isRoomActive(roomId: string): boolean {
+    return rooms.has(roomId);
+}
+
 const ADMIN_GRACE_PERIOD_MS = 15_000; // 15s grace period for admin reconnect
 const MIN_PTT_DURATION_MS = 800;      // Minimum PTT duration for valid recording
 
