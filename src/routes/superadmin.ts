@@ -31,9 +31,14 @@ const router = Router();
 // POST /api/superadmin/login
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
     try {
-        const { username, password } = req.body;
+        const { username, password, host } = req.body;
         if (!username || !password) {
             res.status(400).json({ error: 'Username and password are required' });
+            return;
+        }
+
+        if (host && host !== 'skai.deveraa.com' && !host.includes('localhost') && !host.includes('127.0.0.1')) {
+            res.status(403).json({ error: 'Super Admin login is only allowed on the main network.' });
             return;
         }
 
@@ -83,7 +88,7 @@ router.post('/admins', authMiddleware(['superadmin']), upload.single('logo'), as
 
         let logoUrl = '';
         if (req.file) {
-            logoUrl = `/logos/${req.file.filename}`;
+            logoUrl = `/api/logos/${req.file.filename}`;
         }
 
         const passwordHash = await bcrypt.hash(password, 10);
@@ -175,7 +180,7 @@ router.put('/admins/:id', authMiddleware(['superadmin']), upload.single('logo'),
         }
 
         if (req.file) {
-            update.logoUrl = `/logos/${req.file.filename}`;
+            update.logoUrl = `/api/logos/${req.file.filename}`;
         }
 
         const admin = await Admin.findByIdAndUpdate(req.params.id, update, { new: true, projection: '-passwordHash' });

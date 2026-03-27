@@ -12,7 +12,7 @@ const router = Router();
 // POST /api/admin/login
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
     try {
-        const { username, password } = req.body;
+        const { username, password, host } = req.body;
         if (!username || !password) {
             res.status(400).json({ error: 'Username and password are required' });
             return;
@@ -22,6 +22,23 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
         if (!admin) {
             res.status(401).json({ error: 'Invalid credentials' });
             return;
+        }
+
+        if (host) {
+            const requestedDomain = host.toLowerCase();
+            const hostOwner = await Admin.findOne({ subdomain: requestedDomain });
+            
+            if (hostOwner) {
+                if (String(hostOwner._id) !== String(admin._id)) {
+                    res.status(403).json({ error: 'You are not authorized to log into this portal.' });
+                    return;
+                }
+            } else {
+                if (admin.subdomain) {
+                    res.status(403).json({ error: `Please log in using your dedicated portal.` });
+                    return;
+                }
+            }
         }
 
         if (!admin.isActive) {

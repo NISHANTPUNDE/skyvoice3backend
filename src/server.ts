@@ -68,7 +68,7 @@ async function main() {
         fs.mkdirSync(logosDir, { recursive: true });
         console.log('Created logos directory:', logosDir);
     }
-    app.use('/logos', express.static(logosDir));
+    app.use('/api/logos', express.static(logosDir));
 
     // Create HTTP server
     const httpServer = http.createServer(app);
