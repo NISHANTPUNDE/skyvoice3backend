@@ -5,6 +5,26 @@ import { SuperAdmin } from '../models/SuperAdmin';
 import { Admin } from '../models/Admin';
 import { authMiddleware, generateToken } from '../middleware/auth';
 import { encryptPassword, decryptPassword } from '../utils/crypto';
+import multer from 'multer';
+import * as path from 'path';
+import * as fs from 'fs';
+
+const logosDir = path.resolve(process.cwd(), 'logos');
+if (!fs.existsSync(logosDir)) {
+    fs.mkdirSync(logosDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+    destination: (_req, _file, cb) => {
+        cb(null, logosDir);
+    },
+    filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname) || '.png';
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+        cb(null, `logo-${uniqueSuffix}${ext}`);
+    }
+});
+const upload = multer({ storage });
 
 const router = Router();
 
@@ -38,9 +58,9 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
 });
 
 // POST /api/superadmin/admins — create admin
-router.post('/admins', authMiddleware(['superadmin']), async (req: Request, res: Response): Promise<void> => {
+router.post('/admins', authMiddleware(['superadmin']), upload.single('logo'), async (req: Request, res: Response): Promise<void> => {
     try {
-        const { name, username, password, userLimit } = req.body;
+        const { name, username, password, userLimit, subdomain } = req.body;
         if (!name || !username || !password) {
             res.status(400).json({ error: 'name, username, and password are required' });
             return;
@@ -52,6 +72,20 @@ router.post('/admins', authMiddleware(['superadmin']), async (req: Request, res:
             return;
         }
 
+        let parsedSubdomain = subdomain?.trim().toLowerCase();
+        if (parsedSubdomain) {
+            const existingSub = await Admin.findOne({ subdomain: parsedSubdomain });
+            if (existingSub) {
+                res.status(409).json({ error: 'Admin with this subdomain already exists' });
+                return;
+            }
+        }
+
+        let logoUrl = '';
+        if (req.file) {
+            logoUrl = `/logos/${req.file.filename}`;
+        }
+
         const passwordHash = await bcrypt.hash(password, 10);
         const encPwd = encryptPassword(password);
         const admin = await Admin.create({
@@ -60,7 +94,9 @@ router.post('/admins', authMiddleware(['superadmin']), async (req: Request, res:
             passwordHash,
             encryptedPassword: encPwd,
             createdBy: req.auth!.id,
-            userLimit: userLimit || 0,
+            userLimit: userLimit ? parseInt(userLimit) : 0,
+            subdomain: parsedSubdomain || undefined,
+            logoUrl,
         });
 
         res.status(201).json({
@@ -105,9 +141,9 @@ router.get('/admins', authMiddleware(['superadmin']), async (req: Request, res: 
 });
 
 // PUT /api/superadmin/admins/:id — update admin
-router.put('/admins/:id', authMiddleware(['superadmin']), async (req: Request, res: Response): Promise<void> => {
+router.put('/admins/:id', authMiddleware(['superadmin']), upload.single('logo'), async (req: Request, res: Response): Promise<void> => {
     try {
-        const { name, username, password, userLimit } = req.body;
+        const { name, username, password, userLimit, subdomain } = req.body;
         const update: any = {};
         if (name) update.name = name;
         if (username) {
@@ -122,7 +158,25 @@ router.put('/admins/:id', authMiddleware(['superadmin']), async (req: Request, r
             update.passwordHash = await bcrypt.hash(password, 10);
             update.encryptedPassword = encryptPassword(password);
         }
-        if (userLimit !== undefined) update.userLimit = userLimit;
+        if (userLimit !== undefined) update.userLimit = parseInt(userLimit);
+
+        if (subdomain !== undefined) {
+            const parsedSubdomain = subdomain.trim().toLowerCase();
+            if (parsedSubdomain) {
+                const existingSub = await Admin.findOne({ subdomain: parsedSubdomain, _id: { $ne: new Types.ObjectId(req.params.id as string) } });
+                if (existingSub) {
+                    res.status(409).json({ error: 'Subdomain already taken' });
+                    return;
+                }
+                update.subdomain = parsedSubdomain;
+            } else {
+                update.$unset = { subdomain: 1 };
+            }
+        }
+
+        if (req.file) {
+            update.logoUrl = `/logos/${req.file.filename}`;
+        }
 
         const admin = await Admin.findByIdAndUpdate(req.params.id, update, { new: true, projection: '-passwordHash' });
         if (!admin) {

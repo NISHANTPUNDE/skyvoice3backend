@@ -22,6 +22,7 @@
     "jsonwebtoken": "^9.0.3",
     "mediasoup": "^3.19.17",
     "mongoose": "^9.2.1",
+    "multer": "^2.1.1",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.9.3",
     "uuid": "^13.0.0",
@@ -32,6 +33,7 @@
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
+    "@types/multer": "^2.1.0",
     "@types/uuid": "^11.0.0"
   }
 }

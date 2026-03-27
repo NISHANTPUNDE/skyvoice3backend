@@ -15,6 +15,7 @@ import superadminRoutes from './routes/superadmin';
 import adminRoutes from './routes/admin';
 import userRoutes from './routes/user';
 import recordingsRoutes from './routes/recordings';
+import publicRoutes from './routes/public';
 
 async function main() {
     // Connect to MongoDB
@@ -58,7 +59,16 @@ async function main() {
     app.use('/api/superadmin', superadminRoutes);
     app.use('/api/admin', adminRoutes);
     app.use('/api/user', userRoutes);
-    app.use('/api/admin/recordings', recordingsRoutes);
+    app.use('/api/recordings', recordingsRoutes);
+    app.use('/api/public', publicRoutes);
+
+    // Serve uploaded logos statically
+    const logosDir = path.resolve(process.cwd(), 'logos');
+    if (!fs.existsSync(logosDir)) {
+        fs.mkdirSync(logosDir, { recursive: true });
+        console.log('Created logos directory:', logosDir);
+    }
+    app.use('/logos', express.static(logosDir));
 
     // Create HTTP server
     const httpServer = http.createServer(app);
