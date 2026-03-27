@@ -26,7 +26,12 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
 
         if (host) {
             const requestedDomain = host.toLowerCase();
-            const hostOwner = await Admin.findOne({ subdomain: requestedDomain });
+            const hostPrefix = requestedDomain.split('.')[0];
+
+            let hostOwner = await Admin.findOne({ subdomain: requestedDomain });
+            if (!hostOwner) {
+                hostOwner = await Admin.findOne({ subdomain: hostPrefix });
+            }
             
             if (hostOwner) {
                 if (String(hostOwner._id) !== String(admin._id)) {

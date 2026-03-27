@@ -13,9 +13,14 @@ router.get('/config', async (req: Request, res: Response): Promise<void> => {
             return;
         }
 
-        // The host might be exactly the subdomain they entered, e.g. 'admin1.skai.deveraa.com'
-        // We match it case-insensitively
-        const admin = await Admin.findOne({ subdomain: host.toLowerCase() });
+        const exactHost = host.toLowerCase();
+        const hostPrefix = exactHost.split('.')[0]; // admin2.skai.deveraa.com -> admin2
+
+        // Try exact match first, then fallback to just the prefix
+        let admin = await Admin.findOne({ subdomain: exactHost });
+        if (!admin) {
+            admin = await Admin.findOne({ subdomain: hostPrefix });
+        }
 
         if (!admin) {
             // If no match found, fallback to default branding
