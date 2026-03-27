@@ -14,13 +14,15 @@ router.get('/config', async (req: Request, res: Response): Promise<void> => {
         }
 
         const exactHost = host.toLowerCase();
-        const hostPrefix = exactHost.split('.')[0]; // admin2.skai.deveraa.com -> admin2
-
-        // Try exact match first, then fallback to just the prefix
-        let admin = await Admin.findOne({ subdomain: exactHost });
-        if (!admin) {
-            admin = await Admin.findOne({ subdomain: hostPrefix });
+        
+        // Generate ['admin2.skai.deveraa.com', 'admin2.skai.deveraa', 'admin2.skai', 'admin2']
+        const parts = exactHost.split('.');
+        const prefixes = [];
+        for (let i = parts.length; i > 0; i--) {
+            prefixes.push(parts.slice(0, i).join('.'));
         }
+
+        const admin = await Admin.findOne({ subdomain: { $in: prefixes } });
 
         if (!admin) {
             // If no match found, fallback to default branding

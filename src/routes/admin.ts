@@ -26,12 +26,13 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
 
         if (host) {
             const requestedDomain = host.toLowerCase();
-            const hostPrefix = requestedDomain.split('.')[0];
-
-            let hostOwner = await Admin.findOne({ subdomain: requestedDomain });
-            if (!hostOwner) {
-                hostOwner = await Admin.findOne({ subdomain: hostPrefix });
+            const parts = requestedDomain.split('.');
+            const prefixes = [];
+            for (let i = parts.length; i > 0; i--) {
+                prefixes.push(parts.slice(0, i).join('.'));
             }
+
+            const hostOwner = await Admin.findOne({ subdomain: { $in: prefixes } });
             
             if (hostOwner) {
                 if (String(hostOwner._id) !== String(admin._id)) {
