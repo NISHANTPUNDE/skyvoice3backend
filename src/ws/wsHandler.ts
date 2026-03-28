@@ -396,7 +396,7 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                 const producer = await listener.producerTransport.produce({
                     kind: msg.kind,
                     rtpParameters: msg.rtpParameters,
-                    paused: true, // Start paused (PTT off)
+                    paused: false, // Ensure both admins and users ALWAYS start strictly unpaused and "HOT"
                 });
                 listener.producer = producer;
 
@@ -709,9 +709,8 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                 console.error('Failed to start recording:', err);
             }
 
-            // Resume user's producer server-side AFTER FFmpeg is 100% ready.
-            // This prevents 300ms of RTP packets from clipping/dropping into the void!
-            await listener.producer.resume();
+            // Stop FFmpeg completely!
+            // No producer.resume() needed — backend is always running hot!
 
             // Notify all admins
             broadcastToAdmins(msg.roomId, {
@@ -734,8 +733,7 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
 
             listener.isPtt = false;
 
-            // Pause user's producer server-side
-            await listener.producer.pause();
+            // No producer.pause() needed — mobile App natively mutes the track to save bandwidth!
 
             // Notify all admins
             broadcastToAdmins(msg.roomId, {
