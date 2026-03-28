@@ -66,12 +66,17 @@ router.get('/:roomId/:userId', authMiddleware(['admin']), async (req: Request, r
     }
 });
 
-// GET /api/admin/recordings/download/:roomId/:userId/:filename — download individual segment
-router.get('/download/:roomId/:userId/:filename', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
+// GET /api/admin/recordings/stream — download individual segment
+router.get('/stream', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
-        const roomId = Array.isArray(req.params.roomId) ? req.params.roomId[0] : req.params.roomId;
-        const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
-        const filename = Array.isArray(req.params.filename) ? req.params.filename[0] : req.params.filename;
+        const roomId = req.query.roomId as string;
+        const userId = req.query.userId as string;
+        const filename = req.query.filename as string;
+        
+        if (!roomId || !userId || !filename) {
+            res.status(400).json({ error: 'roomId, userId, and filename query parameters required' });
+            return;
+        }
         const filepath = getRecordingFilePath(roomId, userId, filename);
         if (!filepath) {
             res.status(404).json({ error: 'Recording not found' });

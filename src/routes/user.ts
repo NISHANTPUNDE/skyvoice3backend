@@ -154,12 +154,17 @@ router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Re
     }
 });
 
-// GET /api/user/recordings/download/:roomId/:filename — download a recording file
-router.get('/recordings/download/:roomId/:filename', authMiddleware(['user']), async (req: Request, res: Response): Promise<void> => {
+// GET /api/user/recordings/stream — download a recording file
+router.get('/recordings/stream', authMiddleware(['user']), async (req: Request, res: Response): Promise<void> => {
     try {
         const userId = req.auth!.id;
-        const roomId = String(req.params.roomId);
-        const filename = String(req.params.filename);
+        const roomId = req.query.roomId as string;
+        const filename = req.query.filename as string;
+
+        if (!roomId || !filename) {
+            res.status(400).json({ error: 'roomId and filename query parameters required' });
+            return;
+        }
 
         const filepath = getRecordingFilePath(roomId, userId, filename);
         if (!filepath) {
