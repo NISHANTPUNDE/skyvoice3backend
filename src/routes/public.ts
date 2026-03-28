@@ -1,5 +1,7 @@
 import { Router, Request, Response } from 'express';
+import * as path from 'path';
 import { Admin } from '../models/Admin';
+import { getRecordingFilePath } from '../media/recording';
 
 const router = Router();
 
@@ -43,6 +45,35 @@ router.get('/config', async (req: Request, res: Response): Promise<void> => {
 
     } catch (err) {
         console.error('Public config error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// GET /api/public/recordings/stream
+// Completely public endpoint to stream recordings for native mobile players
+router.get('/recordings/stream', async (req: Request, res: Response): Promise<void> => {
+    try {
+        const roomId = req.query.roomId as string;
+        const userId = req.query.userId as string;
+        const filename = req.query.filename as string;
+
+        if (!roomId || !userId || !filename) {
+            res.status(400).json({ error: 'roomId, userId, and filename parameters required' });
+            return;
+        }
+
+        const filepath = getRecordingFilePath(roomId, userId, filename);
+        if (!filepath) {
+            res.status(404).json({ error: 'Recording not found' });
+            return;
+        }
+
+        const contentType = filename.endsWith('.webm') ? 'audio/webm' : 'audio/mpeg';
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Disposition', `inline; filename="${path.basename(filename).replace(/"/g, '')}"`);
+        res.sendFile(filepath);
+    } catch (err) {
+        console.error('Public streaming error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });

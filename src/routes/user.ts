@@ -119,7 +119,7 @@ const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
 router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Response): Promise<void> => {
     try {
         const userId = req.auth!.id;
-        const result: Array<{ roomId: string; filename: string; startTime: number; size: number }> = [];
+        const result: Array<{ roomId: string; userId: string; filename: string; startTime: number; size: number }> = [];
 
         if (!fs.existsSync(RECORDINGS_DIR)) {
             res.json([]);
@@ -138,6 +138,7 @@ router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Re
                 const stats = fs.statSync(filepath);
                 result.push({
                     roomId: roomDir.name,
+                    userId,
                     filename,
                     startTime: stats.mtimeMs,
                     size: stats.size,
@@ -150,34 +151,6 @@ router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Re
         res.json(result);
     } catch (err) {
         console.error('User recordings error:', err);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// GET /api/user/recordings/stream — download a recording file
-router.get('/recordings/stream', authMiddleware(['user']), async (req: Request, res: Response): Promise<void> => {
-    try {
-        const userId = req.auth!.id;
-        const roomId = req.query.roomId as string;
-        const filename = req.query.filename as string;
-
-        if (!roomId || !filename) {
-            res.status(400).json({ error: 'roomId and filename query parameters required' });
-            return;
-        }
-
-        const filepath = getRecordingFilePath(roomId, userId, filename);
-        if (!filepath) {
-            res.status(404).json({ error: 'Recording not found' });
-            return;
-        }
-
-        const contentType = filename.endsWith('.webm') ? 'audio/webm' : 'audio/mpeg';
-        res.setHeader('Content-Type', contentType);
-        res.setHeader('Content-Disposition', `inline; filename="${path.basename(filename).replace(/"/g, '')}"`);
-        res.sendFile(filepath);
-    } catch (err) {
-        console.error('User recording download error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });
