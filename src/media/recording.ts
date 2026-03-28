@@ -279,12 +279,14 @@ export async function startRecording(
     // NOW connect transports — RTP data flows to ready FFmpeg
     try {
         await transports.userTransport.connect({ ip: '127.0.0.1', port: userPort });
+        await transports.userConsumer.resume();
     } catch (err) {
         console.error(`[Recording] Failed to connect user transport for ${key}:`, err);
     }
 
     try {
         await transports.adminTransport.connect({ ip: '127.0.0.1', port: adminPort });
+        await transports.adminConsumer.resume();
     } catch (err) {
         console.error(`[Recording] Failed to connect admin transport for ${key}:`, err);
     }
