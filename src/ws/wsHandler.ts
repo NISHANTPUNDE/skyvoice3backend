@@ -702,7 +702,15 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             listener.isPtt = true;
             (listener as any)._pttStartTime = Date.now();
 
-            // Resume user's producer server-side
+            // Start recording for each admin FIRST so FFmpeg's UDP port is fully listening.
+            try {
+                await startRecordingForUser(room, msg.roomId, auth.id);
+            } catch (err) {
+                console.error('Failed to start recording:', err);
+            }
+
+            // Resume user's producer server-side AFTER FFmpeg is 100% ready.
+            // This prevents 300ms of RTP packets from clipping/dropping into the void!
             await listener.producer.resume();
 
             // Notify all admins
@@ -713,13 +721,6 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
                 roomId: msg.roomId,
                 listeners: getListenersList(msg.roomId),
             });
-
-            // Start recording for each admin
-            try {
-                await startRecordingForUser(room, msg.roomId, auth.id);
-            } catch (err) {
-                console.error('Failed to start recording:', err);
-            }
             break;
         }
 

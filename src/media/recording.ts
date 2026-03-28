@@ -95,8 +95,10 @@ function spawnSingleStreamFfmpeg(
 ): ChildProcess {
     const ffmpegArgs = [
         '-protocol_whitelist', 'file,crypto,udp,rtp',
-        '-analyzeduration', '5000000',
-        '-probesize', '1000000',
+        // Extreme low-latency probing: force FFmpeg to instantly accept the codec
+        // This stops FFmpeg from waiting 5 seconds on short PTT speeches.
+        '-analyzeduration', '100000', 
+        '-probesize', '65536',
         '-fflags', '+genpts+discardcorrupt',
         '-i', sdpPath,
 
