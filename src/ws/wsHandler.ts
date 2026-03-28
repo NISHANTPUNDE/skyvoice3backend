@@ -814,6 +814,25 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             break;
         }
 
+        case 'set-user-mute': {
+            if (auth.role !== 'admin') {
+                sendJson(ws, { type: 'error', message: 'Only admins can mute users' });
+                return;
+            }
+            const room = rooms.get(msg.roomId);
+            if (!room) return;
+
+            const listener = room.listeners.get(msg.userId);
+            if (listener) {
+                // Relay mute override to the user
+                sendJson(listener.ws, { 
+                    type: 'admin-mute-override',
+                    isMuted: msg.isMuted 
+                });
+            }
+            break;
+        }
+
         default:
             sendJson(ws, { type: 'error', message: `Unknown message type: ${msg.type}` });
     }

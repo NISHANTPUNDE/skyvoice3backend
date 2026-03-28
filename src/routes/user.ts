@@ -115,16 +115,38 @@ router.get('/rooms', authMiddleware(['user']), async (req: Request, res: Respons
 
 const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
 
-// GET /api/user/recordings — list all recordings for this user across all rooms
+// GET /api/user/recordings — list all recordings for this user grouped by Room (Call Session)
 router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Response): Promise<void> => {
     try {
         const userId = req.auth!.id;
-        const result: Array<{ roomId: string; userId: string; filename: string; startTime: number; size: number }> = [];
+        interface Segment {
+            filename: string;
+            startTime: number;
+            size: number;
+        }
+        interface CallSession {
+            roomId: string;
+            userId: string;
+            startTime: number;
+            segments: Segment[];
+        }
+        const sessions: CallSession[] = [];
 
         if (!fs.existsSync(RECORDINGS_DIR)) {
             res.json([]);
             return;
         }
+
+        // Helper to accurately extract precise start time from filament
+        const extractStartTime = (filename: string): number => {
+            try {
+                const isoLike = filename.replace('segment_', '').replace('.mp3', '').replace('.webm', '');
+                // segment_2026-03-28T08-12-24-312Z.mp3 -> 2026-03-28T08:12:24.312Z
+                const restored = isoLike.replace(/T(\d+)-(\d+)-(\d+)-(\d+)Z/, 'T$1:$2:$3.$4Z');
+                const ts = new Date(restored).getTime();
+                return isNaN(ts) ? 0 : ts;
+            } catch { return 0; }
+        };
 
         // Scan all room directories for this user's recordings
         const roomDirs = fs.readdirSync(RECORDINGS_DIR, { withFileTypes: true }).filter(d => d.isDirectory());
@@ -132,23 +154,37 @@ router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Re
             const userDir = path.join(RECORDINGS_DIR, roomDir.name, userId);
             if (!fs.existsSync(userDir)) continue;
 
-            const files = fs.readdirSync(userDir).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_')).sort().reverse();
+            const files = fs.readdirSync(userDir).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_')).sort();
+            if (files.length === 0) continue;
+
+            const segments: Segment[] = [];
             for (const filename of files) {
                 const filepath = path.join(userDir, filename);
                 const stats = fs.statSync(filepath);
-                result.push({
-                    roomId: roomDir.name,
-                    userId,
+                let startTime = extractStartTime(filename);
+                if (!startTime) startTime = stats.mtimeMs; // fallback
+
+                segments.push({
                     filename,
-                    startTime: stats.mtimeMs,
+                    startTime,
                     size: stats.size,
                 });
             }
+
+            // Always chronological inside the folder
+            segments.sort((a, b) => a.startTime - b.startTime);
+
+            sessions.push({
+                roomId: roomDir.name,
+                userId,
+                startTime: segments[0].startTime, // First segment dictated overall session start
+                segments,
+            });
         }
 
-        // Sort by newest first
-        result.sort((a, b) => b.startTime - a.startTime);
-        res.json(result);
+        // Sort folders by newest session first
+        sessions.sort((a, b) => b.startTime - a.startTime);
+        res.json(sessions);
     } catch (err) {
         console.error('User recordings error:', err);
         res.status(500).json({ error: 'Server error' });

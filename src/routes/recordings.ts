@@ -4,9 +4,11 @@ import * as fs from 'fs';
 import { authMiddleware } from '../middleware/auth';
 import { getRecordingsForRoom, getRecordingFilePath, getRecordingsDir } from '../media/recording';
 
+import { User } from '../models/User';
+
 const router = Router();
 
-// GET /api/admin/recordings — list all rooms that have recordings
+// GET /api/admin/recordings — list all users that have recordings
 router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
         const recDir = getRecordingsDir();
@@ -14,28 +16,96 @@ router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): 
             res.json([]);
             return;
         }
+        
+        const userMap = new Map<string, { totalRecordings: number; rooms: { roomId: string, createdAt: number }[] }>();
         const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
-        const rooms = roomDirs.map(d => {
-            const roomPath = path.join(recDir, d.name);
+        
+        for (const roomDir of roomDirs) {
+            const roomPath = path.join(recDir, roomDir.name);
             const userDirs = fs.readdirSync(roomPath, { withFileTypes: true }).filter(u => u.isDirectory());
-            let totalRecordings = 0;
-            const users: Array<{ userId: string; count: number }> = [];
-            for (const u of userDirs) {
-                const files = fs.readdirSync(path.join(roomPath, u.name)).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_'));
+            const roomCreatedAt = fs.statSync(roomPath).mtimeMs;
+
+            for (const userDir of userDirs) {
+                const userId = userDir.name;
+                const files = fs.readdirSync(path.join(roomPath, userId)).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_'));
                 if (files.length > 0) {
-                    totalRecordings += files.length;
-                    users.push({ userId: u.name, count: files.length });
+                    if (!userMap.has(userId)) {
+                        userMap.set(userId, { totalRecordings: 0, rooms: [] });
+                    }
+                    const userEntry = userMap.get(userId)!;
+                    userEntry.totalRecordings += files.length;
+                    userEntry.rooms.push({ roomId: roomDir.name, createdAt: roomCreatedAt });
                 }
             }
-            // Get room directory modification time as a rough creation time
-            const stats = fs.statSync(roomPath);
-            return { roomId: d.name, totalRecordings, users, createdAt: stats.mtimeMs };
-        }).filter(r => r.totalRecordings > 0);
+        }
 
-        rooms.sort((a, b) => b.createdAt - a.createdAt);
-        res.json(rooms);
+        // Fetch usernames from DB
+        const usersResult: any[] = [];
+        for (const [userId, data] of userMap.entries()) {
+            let userName = 'Unknown User';
+            try {
+                const userDoc = await User.findById(userId).select('name').lean();
+                if (userDoc) userName = userDoc.name;
+            } catch { /* ignore invalid ObjectIds */ }
+
+            data.rooms.sort((a, b) => b.createdAt - a.createdAt); // newest rooms first
+            usersResult.push({
+                userId,
+                userName,
+                totalRecordings: data.totalRecordings,
+                rooms: data.rooms
+            });
+        }
+        
+        usersResult.sort((a, b) => a.userName.localeCompare(b.userName));
+        res.json(usersResult);
     } catch (err) {
         console.error('List all recordings error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// GET /api/admin/recordings/user/:userId — list segments for specific user across all rooms
+router.get('/user/:userId', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
+        const result: Record<string, any[]> = {}; // roomId -> segments[]
+        
+        const recDir = getRecordingsDir();
+        if (!fs.existsSync(recDir)) {
+            res.json(result);
+            return;
+        }
+        
+        const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
+        for (const roomDir of roomDirs) {
+            const userDir = path.join(recDir, roomDir.name, userId);
+            if (fs.existsSync(userDir)) {
+                const files = fs.readdirSync(userDir).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_')).sort();
+                if (files.length > 0) {
+                    result[roomDir.name] = files.map(filename => {
+                        const filepath = path.join(userDir, filename);
+                        const stats = fs.statSync(filepath);
+                        let startTime = 0;
+                        try {
+                            const isoLike = filename.replace('segment_', '').replace('.mp3', '').replace('.webm', '');
+                            const restored = isoLike.replace(/T(\d+)-(\d+)-(\d+)-(\d+)Z/, 'T$1:$2:$3.$4Z');
+                            const ts = new Date(restored).getTime();
+                            startTime = isNaN(ts) ? stats.mtimeMs : ts;
+                        } catch { startTime = stats.mtimeMs; }
+
+                        return {
+                            filename,
+                            startTime,
+                            size: stats.size,
+                        };
+                    });
+                }
+            }
+        }
+        res.json(result);
+    } catch (err) {
+        console.error('List user recordings error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });
