@@ -3,23 +3,49 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { authMiddleware } from '../middleware/auth';
 import { getRecordingsForRoom, getRecordingFilePath, getRecordingsDir } from '../media/recording';
-
 import { User } from '../models/User';
 
 const router = Router();
 
-// GET /api/admin/recordings — list all users that have recordings
+// Helper: get all userIds belonging to this admin
+async function getAdminUserIds(adminId: string): Promise<string[]> {
+    const users = await User.find({ adminId, isDeleted: { $ne: true } }).select('_id').lean();
+    return users.map(u => String(u._id));
+}
+
+// Helper: parse segment filename into a timestamp
+function parseSegmentTime(filename: string): number {
+    try {
+        const isoLike = filename.replace('segment_', '').replace('.mp3', '').replace('.webm', '');
+        const restored = isoLike.replace(/T(\d+)-(\d+)-(\d+)-(\d+)Z/, 'T$1:$2:$3.$4Z');
+        const ts = new Date(restored).getTime();
+        return isNaN(ts) ? 0 : ts;
+    } catch {
+        return 0;
+    }
+}
+
+// GET /api/recordings — list users with recordings (admin-scoped, server-side pagination + search)
+// Query params: search, page (1-based), limit
 router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
+        const adminId = req.auth!.id;
+        const search = ((req.query.search as string) || '').trim().toLowerCase();
+        const page = Math.max(1, parseInt(req.query.page as string) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 10));
+
         const recDir = getRecordingsDir();
         if (!fs.existsSync(recDir)) {
-            res.json([]);
+            res.json({ users: [], total: 0, page, pages: 0 });
             return;
         }
-        
+
+        // Get only this admin's user IDs
+        const allowedUserIds = new Set(await getAdminUserIds(adminId));
+
         const userMap = new Map<string, { totalRecordings: number; rooms: { roomId: string, createdAt: number }[] }>();
         const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
-        
+
         for (const roomDir of roomDirs) {
             const roomPath = path.join(recDir, roomDir.name);
             const userDirs = fs.readdirSync(roomPath, { withFileTypes: true }).filter(u => u.isDirectory());
@@ -27,6 +53,9 @@ router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): 
 
             for (const userDir of userDirs) {
                 const userId = userDir.name;
+                // Skip users not belonging to this admin
+                if (!allowedUserIds.has(userId)) continue;
+
                 const files = fs.readdirSync(path.join(roomPath, userId)).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_'));
                 if (files.length > 0) {
                     if (!userMap.has(userId)) {
@@ -39,8 +68,8 @@ router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): 
             }
         }
 
-        // Fetch usernames from DB
-        const usersResult: any[] = [];
+        // Fetch usernames from DB and apply search filter
+        let usersResult: any[] = [];
         for (const [userId, data] of userMap.entries()) {
             let userName = 'Unknown User';
             try {
@@ -48,7 +77,12 @@ router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): 
                 if (userDoc) userName = userDoc.name;
             } catch { /* ignore invalid ObjectIds */ }
 
-            data.rooms.sort((a, b) => b.createdAt - a.createdAt); // newest rooms first
+            // Apply search filter
+            if (search && !userName.toLowerCase().includes(search) && !userId.toLowerCase().includes(search)) {
+                continue;
+            }
+
+            data.rooms.sort((a, b) => b.createdAt - a.createdAt);
             usersResult.push({
                 userId,
                 userName,
@@ -56,27 +90,42 @@ router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): 
                 rooms: data.rooms
             });
         }
-        
+
         usersResult.sort((a, b) => a.userName.localeCompare(b.userName));
-        res.json(usersResult);
+
+        // Paginate
+        const total = usersResult.length;
+        const pages = Math.ceil(total / limit);
+        const offset = (page - 1) * limit;
+        usersResult = usersResult.slice(offset, offset + limit);
+
+        res.json({ users: usersResult, total, page, pages, limit });
     } catch (err) {
         console.error('List all recordings error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });
 
-// GET /api/admin/recordings/user/:userId — list segments for specific user across all rooms
+// GET /api/recordings/user/:userId — list segments for specific user (admin-scoped)
 router.get('/user/:userId', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
+        const adminId = req.auth!.id;
         const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
-        const result: Record<string, any[]> = {}; // roomId -> segments[]
-        
+
+        // Verify ownership
+        const userDoc = await User.findOne({ _id: userId, adminId }).select('_id').lean();
+        if (!userDoc) {
+            res.status(403).json({ error: 'User does not belong to this admin' });
+            return;
+        }
+
+        const result: Record<string, any[]> = {};
         const recDir = getRecordingsDir();
         if (!fs.existsSync(recDir)) {
             res.json(result);
             return;
         }
-        
+
         const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
         for (const roomDir of roomDirs) {
             const userDir = path.join(recDir, roomDir.name, userId);
@@ -86,19 +135,8 @@ router.get('/user/:userId', authMiddleware(['admin']), async (req: Request, res:
                     result[roomDir.name] = files.map(filename => {
                         const filepath = path.join(userDir, filename);
                         const stats = fs.statSync(filepath);
-                        let startTime = 0;
-                        try {
-                            const isoLike = filename.replace('segment_', '').replace('.mp3', '').replace('.webm', '');
-                            const restored = isoLike.replace(/T(\d+)-(\d+)-(\d+)-(\d+)Z/, 'T$1:$2:$3.$4Z');
-                            const ts = new Date(restored).getTime();
-                            startTime = isNaN(ts) ? stats.mtimeMs : ts;
-                        } catch { startTime = stats.mtimeMs; }
-
-                        return {
-                            filename,
-                            startTime,
-                            size: stats.size,
-                        };
+                        const startTime = parseSegmentTime(filename) || stats.mtimeMs;
+                        return { filename, startTime, size: stats.size };
                     });
                 }
             }
@@ -117,7 +155,7 @@ router.get('/stream', authMiddleware(['admin']), async (req: Request, res: Respo
         const roomId = req.query.roomId as string;
         const userId = req.query.userId as string;
         const filename = req.query.filename as string;
-        
+
         if (!roomId || !userId || !filename) {
             res.status(400).json({ error: 'roomId, userId, and filename query parameters required' });
             return;
@@ -130,6 +168,85 @@ router.get('/stream', authMiddleware(['admin']), async (req: Request, res: Respo
         res.download(filepath, filename);
     } catch (err) {
         console.error('Download recording error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// DELETE /api/recordings/user/:userId — delete all recordings for a user
+router.delete('/user/:userId', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const adminId = req.auth!.id;
+        const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
+
+        // Verify ownership
+        const userDoc = await User.findOne({ _id: userId, adminId }).select('_id').lean();
+        if (!userDoc) {
+            res.status(403).json({ error: 'User does not belong to this admin' });
+            return;
+        }
+
+        const recDir = getRecordingsDir();
+        if (!fs.existsSync(recDir)) {
+            res.json({ message: 'No recordings found', deleted: 0 });
+            return;
+        }
+
+        let deleted = 0;
+        const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
+        for (const roomDir of roomDirs) {
+            const userDir = path.join(recDir, roomDir.name, userId);
+            if (fs.existsSync(userDir)) {
+                const files = fs.readdirSync(userDir);
+                for (const f of files) {
+                    try { fs.unlinkSync(path.join(userDir, f)); deleted++; } catch { /* ok */ }
+                }
+                try { fs.rmdirSync(userDir); } catch { /* ok */ }
+            }
+        }
+        res.json({ message: `Deleted ${deleted} recordings for user`, deleted });
+    } catch (err) {
+        console.error('Delete user recordings error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// DELETE /api/recordings/bulk — delete recordings for multiple users
+router.delete('/bulk', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const adminId = req.auth!.id;
+        const { userIds } = req.body as { userIds: string[] };
+
+        if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+            res.status(400).json({ error: 'userIds array is required' });
+            return;
+        }
+
+        // Verify all users belong to this admin
+        const allowedUserIds = new Set(await getAdminUserIds(adminId));
+        const validIds = userIds.filter(id => allowedUserIds.has(id));
+
+        const recDir = getRecordingsDir();
+        let totalDeleted = 0;
+
+        if (fs.existsSync(recDir)) {
+            const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
+            for (const userId of validIds) {
+                for (const roomDir of roomDirs) {
+                    const userDir = path.join(recDir, roomDir.name, userId);
+                    if (fs.existsSync(userDir)) {
+                        const files = fs.readdirSync(userDir);
+                        for (const f of files) {
+                            try { fs.unlinkSync(path.join(userDir, f)); totalDeleted++; } catch { /* ok */ }
+                        }
+                        try { fs.rmdirSync(userDir); } catch { /* ok */ }
+                    }
+                }
+            }
+        }
+
+        res.json({ message: `Deleted ${totalDeleted} recordings for ${validIds.length} users`, deleted: totalDeleted });
+    } catch (err) {
+        console.error('Bulk delete recordings error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });

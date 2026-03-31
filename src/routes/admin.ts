@@ -6,8 +6,83 @@ import { User } from '../models/User';
 import { Room } from '../models/Room';
 import { authMiddleware, generateToken } from '../middleware/auth';
 import { encryptPassword, decryptPassword } from '../utils/crypto';
+import multer from 'multer';
+import * as path from 'path';
+import * as fs from 'fs';
+
+const logosDir = path.resolve(process.cwd(), 'logos');
+if (!fs.existsSync(logosDir)) {
+    fs.mkdirSync(logosDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+    destination: (_req, _file, cb) => {
+        cb(null, logosDir);
+    },
+    filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname) || '.png';
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+        cb(null, `logo-${uniqueSuffix}${ext}`);
+    }
+});
+const upload = multer({ storage });
 
 const router = Router();
+
+// GET /api/admin/profile — get admin's own profile
+router.get('/profile', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const admin = await Admin.findById(req.auth!.id).select('-passwordHash').lean();
+        if (!admin) {
+            res.status(404).json({ error: 'Admin not found' });
+            return;
+        }
+        const obj: any = { ...admin };
+        obj.password = obj.encryptedPassword ? decryptPassword(obj.encryptedPassword) : '***';
+        delete obj.encryptedPassword;
+        res.json(obj);
+    } catch (err) {
+        console.error('Get profile error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// PUT /api/admin/profile — update admin's own profile
+router.put('/profile', authMiddleware(['admin']), upload.single('logo'), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const { name, username, password } = req.body;
+        const update: any = {};
+        if (name) update.name = name;
+        if (username) {
+            const existing = await Admin.findOne({ username: username.toLowerCase(), _id: { $ne: new Types.ObjectId(req.auth!.id) } });
+            if (existing) {
+                res.status(409).json({ error: 'Username already taken' });
+                return;
+            }
+            update.username = username.toLowerCase();
+        }
+        if (password) {
+            update.passwordHash = await bcrypt.hash(password, 10);
+            update.encryptedPassword = encryptPassword(password);
+        }
+        if (req.file) {
+            update.logoUrl = `/api/logos/${req.file.filename}`;
+        }
+
+        const admin = await Admin.findByIdAndUpdate(req.auth!.id, update, { new: true, projection: '-passwordHash' });
+        if (!admin) {
+            res.status(404).json({ error: 'Admin not found' });
+            return;
+        }
+        const obj: any = admin.toObject();
+        obj.password = obj.encryptedPassword ? decryptPassword(obj.encryptedPassword) : '***';
+        delete obj.encryptedPassword;
+        res.json(obj);
+    } catch (err) {
+        console.error('Update profile error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
 
 // POST /api/admin/login
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
