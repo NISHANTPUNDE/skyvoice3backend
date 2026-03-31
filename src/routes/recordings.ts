@@ -172,6 +172,44 @@ router.get('/stream', authMiddleware(['admin']), async (req: Request, res: Respo
     }
 });
 
+// DELETE /api/recordings/single — delete a single recording file
+router.delete('/single', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const adminId = req.auth!.id;
+        const { roomId, userId, filename } = req.body as { roomId: string; userId: string; filename: string };
+
+        if (!roomId || !userId || !filename) {
+            res.status(400).json({ error: 'roomId, userId, and filename are required' });
+            return;
+        }
+
+        // Verify ownership
+        const userDoc = await User.findOne({ _id: userId, adminId }).select('_id').lean();
+        if (!userDoc) {
+            res.status(403).json({ error: 'User does not belong to this admin' });
+            return;
+        }
+
+        const filepath = getRecordingFilePath(roomId, userId, filename);
+        if (!filepath) {
+            res.status(404).json({ error: 'Recording not found' });
+            return;
+        }
+
+        try {
+            fs.unlinkSync(filepath);
+        } catch {
+            res.status(500).json({ error: 'Failed to delete file' });
+            return;
+        }
+
+        res.json({ message: 'Recording deleted', filename });
+    } catch (err) {
+        console.error('Delete single recording error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 // DELETE /api/recordings/user/:userId — delete all recordings for a user
 router.delete('/user/:userId', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
