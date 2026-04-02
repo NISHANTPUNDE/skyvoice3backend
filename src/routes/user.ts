@@ -20,16 +20,16 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
             return;
         }
 
-        // Find all active users with this username (may belong to different admins)
-        const users = await User.find({ username: username.toLowerCase(), isDeleted: { $ne: true } });
-        if (users.length === 0) {
+        // Find all users with this username across all admins (active or not)
+        const allUsers = await User.find({ username: username.toLowerCase() });
+        if (allUsers.length === 0) {
             res.status(401).json({ error: 'Invalid credentials' });
             return;
         }
 
         // Try password against each matching user
         let matchedUser = null;
-        for (const u of users) {
+        for (const u of allUsers) {
             const valid = await bcrypt.compare(password, u.passwordHash);
             if (valid) {
                 matchedUser = u;
@@ -39,6 +39,12 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
 
         if (!matchedUser) {
             res.status(401).json({ error: 'Invalid credentials' });
+            return;
+        }
+
+        // Check if matched user account is deactivated
+        if (matchedUser.isDeleted) {
+            res.status(403).json({ error: 'Account deactivated. Contact your admin.' });
             return;
         }
 
