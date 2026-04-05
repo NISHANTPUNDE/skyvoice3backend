@@ -355,37 +355,40 @@ router.delete('/user/:userId', authMiddleware(['admin']), async (req: Request, r
     }
 });
 
-// DELETE /api/recordings/bulk — delete recordings for multiple sessions
+// DELETE /api/recordings/bulk — delete recordings for multiple users
 router.delete('/bulk', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
         const adminId = req.auth!.id;
-        const { sessions } = req.body as { sessions: { roomId: string, userId: string }[] };
+        const { userIds } = req.body as { userIds: string[] };
 
-        if (!sessions || !Array.isArray(sessions) || sessions.length === 0) {
-            res.status(400).json({ error: 'sessions array is required' });
+        if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+            res.status(400).json({ error: 'userIds array is required' });
             return;
         }
 
         const allowedUserIds = new Set(await getAdminUserIds(adminId));
+        const validIds = userIds.filter(id => allowedUserIds.has(id));
+
         const recDir = getRecordingsDir();
         let totalDeleted = 0;
 
         if (fs.existsSync(recDir)) {
-            for (const { roomId, userId } of sessions) {
-                if (!allowedUserIds.has(userId)) continue;
-                
-                const userDir = path.join(recDir, roomId, userId);
-                if (fs.existsSync(userDir)) {
-                    const files = fs.readdirSync(userDir);
-                    for (const f of files) {
-                        try { fs.unlinkSync(path.join(userDir, f)); totalDeleted++; } catch { /* ok */ }
+            const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
+            for (const userId of validIds) {
+                for (const roomDir of roomDirs) {
+                    const userDir = path.join(recDir, roomDir.name, userId);
+                    if (fs.existsSync(userDir)) {
+                        const files = fs.readdirSync(userDir);
+                        for (const f of files) {
+                            try { fs.unlinkSync(path.join(userDir, f)); totalDeleted++; } catch { /* ok */ }
+                        }
+                        try { fs.rmdirSync(userDir); } catch { /* ok */ }
                     }
-                    try { fs.rmdirSync(userDir); } catch { /* ok */ }
                 }
             }
         }
 
-        res.json({ message: `Deleted ${totalDeleted} recordings`, deleted: totalDeleted });
+        res.json({ message: `Deleted ${totalDeleted} recordings for ${validIds.length} users`, deleted: totalDeleted });
     } catch (err) {
         console.error('Bulk delete recordings error:', err);
         res.status(500).json({ error: 'Server error' });
