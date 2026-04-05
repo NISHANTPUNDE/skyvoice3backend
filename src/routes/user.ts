@@ -57,8 +57,8 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
             return;
         }
 
-        // Get admin name
-        const admin = await (await import('../models/Admin')).Admin.findById(matchedUser.adminId, 'name');
+        // Get admin name and logo
+        const admin = await (await import('../models/Admin')).Admin.findById(matchedUser.adminId, 'name logoUrl');
 
         const token = generateToken({ id: String(matchedUser._id), role: 'user' });
         res.json({
@@ -68,6 +68,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
             username: matchedUser.username,
             adminId: matchedUser.adminId,
             adminName: admin?.name || 'Admin',
+            adminLogoUrl: admin?.logoUrl || null,
             userId: matchedUser._id,
         });
     } catch (err) {
@@ -84,11 +85,12 @@ router.get('/me', authMiddleware(['user']), async (req: Request, res: Response):
             res.status(403).json({ error: 'Account not active' });
             return;
         }
-        const admin = await (await import('../models/Admin')).Admin.findById(user.adminId, 'name');
+        const admin = await (await import('../models/Admin')).Admin.findById(user.adminId, 'name logoUrl');
         res.json({
             name: user.name,
             username: user.username,
             adminName: admin?.name || 'Admin',
+            adminLogoUrl: admin?.logoUrl || null,
             userId: user._id,
             adminId: user.adminId,
         });
