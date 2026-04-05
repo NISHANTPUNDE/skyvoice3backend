@@ -106,6 +106,113 @@ router.get('/', authMiddleware(['admin']), async (req: Request, res: Response): 
     }
 });
 
+// GET /api/recordings/sessions — list all CallSessions flattened across all users for this admin
+router.get('/sessions', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const adminId = req.auth!.id;
+        const search = ((req.query.search as string) || '').trim().toLowerCase();
+        const page = Math.max(1, parseInt(req.query.page as string) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 10));
+
+        const recDir = getRecordingsDir();
+        if (!fs.existsSync(recDir)) {
+            res.json({ sessions: [], total: 0, page, pages: 0, limit });
+            return;
+        }
+
+        // 1. Get valid users
+        const allowedUserIds = new Set(await getAdminUserIds(adminId));
+
+        // 2. Fetch User Names mapping
+        const userDocs = await User.find({ _id: { $in: Array.from(allowedUserIds) } }).select('name').lean();
+        const userNameMap = new Map<string, string>();
+        for (const u of userDocs) {
+            userNameMap.set(String(u._id), u.name);
+        }
+
+        interface Segment {
+            filename: string;
+            startTime: number;
+            size: number;
+        }
+        interface CallSession {
+            roomId: string;
+            userId: string;
+            userName: string;
+            startTime: number;
+            segments: Segment[];
+        }
+
+        let allSessions: CallSession[] = [];
+
+        // 3. Scan directory sequentially mapping CallSessions
+        const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
+        for (const roomDir of roomDirs) {
+            const roomPath = path.join(recDir, roomDir.name);
+            const userDirs = fs.readdirSync(roomPath, { withFileTypes: true }).filter(u => u.isDirectory());
+
+            for (const userDir of userDirs) {
+                const userId = userDir.name;
+                
+                // Security Boundary: Force strict admin ownership
+                if (!allowedUserIds.has(userId)) continue;
+
+                // Match Search criteria strictly on valid users
+                const uName = userNameMap.get(userId) || 'Unknown User';
+                if (search && !uName.toLowerCase().includes(search) && !userId.toLowerCase().includes(search)) {
+                    continue;
+                }
+
+                const userPath = path.join(roomPath, userId);
+                const files = fs.readdirSync(userPath).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_')).sort();
+                
+                if (files.length === 0) continue;
+
+                const segments: Segment[] = [];
+                let earliestStartTime = Number.MAX_SAFE_INTEGER;
+
+                for (const filename of files) {
+                    const filepath = path.join(userPath, filename);
+                    const stats = fs.statSync(filepath);
+                    let startTime = parseSegmentTime(filename);
+                    if (!startTime) startTime = stats.mtimeMs; // Fallback
+
+                    if (startTime < earliestStartTime) earliestStartTime = startTime;
+
+                    segments.push({
+                        filename,
+                        startTime,
+                        size: stats.size
+                    });
+                }
+
+                allSessions.push({
+                    roomId: roomDir.name,
+                    userId,
+                    userName: uName,
+                    startTime: earliestStartTime === Number.MAX_SAFE_INTEGER ? Date.now() : earliestStartTime,
+                    segments
+                });
+            }
+        }
+
+        // 4. Sort globally by strictly Time Descending (Chronological match)
+        allSessions.sort((a, b) => b.startTime - a.startTime);
+
+        // 5. Hard server-side pagination for infinite 1000s threshold
+        const total = allSessions.length;
+        const pages = Math.ceil(total / limit);
+        const offset = (page - 1) * limit;
+        
+        const paginatedSessions = allSessions.slice(offset, offset + limit);
+
+        res.json({ sessions: paginatedSessions, total, page, pages, limit });
+    } catch (err) {
+        console.error('List sessions error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 // GET /api/recordings/user/:userId — list segments for specific user (admin-scoped)
 router.get('/user/:userId', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
@@ -248,41 +355,37 @@ router.delete('/user/:userId', authMiddleware(['admin']), async (req: Request, r
     }
 });
 
-// DELETE /api/recordings/bulk — delete recordings for multiple users
+// DELETE /api/recordings/bulk — delete recordings for multiple sessions
 router.delete('/bulk', authMiddleware(['admin']), async (req: Request, res: Response): Promise<void> => {
     try {
         const adminId = req.auth!.id;
-        const { userIds } = req.body as { userIds: string[] };
+        const { sessions } = req.body as { sessions: { roomId: string, userId: string }[] };
 
-        if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
-            res.status(400).json({ error: 'userIds array is required' });
+        if (!sessions || !Array.isArray(sessions) || sessions.length === 0) {
+            res.status(400).json({ error: 'sessions array is required' });
             return;
         }
 
-        // Verify all users belong to this admin
         const allowedUserIds = new Set(await getAdminUserIds(adminId));
-        const validIds = userIds.filter(id => allowedUserIds.has(id));
-
         const recDir = getRecordingsDir();
         let totalDeleted = 0;
 
         if (fs.existsSync(recDir)) {
-            const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
-            for (const userId of validIds) {
-                for (const roomDir of roomDirs) {
-                    const userDir = path.join(recDir, roomDir.name, userId);
-                    if (fs.existsSync(userDir)) {
-                        const files = fs.readdirSync(userDir);
-                        for (const f of files) {
-                            try { fs.unlinkSync(path.join(userDir, f)); totalDeleted++; } catch { /* ok */ }
-                        }
-                        try { fs.rmdirSync(userDir); } catch { /* ok */ }
+            for (const { roomId, userId } of sessions) {
+                if (!allowedUserIds.has(userId)) continue;
+                
+                const userDir = path.join(recDir, roomId, userId);
+                if (fs.existsSync(userDir)) {
+                    const files = fs.readdirSync(userDir);
+                    for (const f of files) {
+                        try { fs.unlinkSync(path.join(userDir, f)); totalDeleted++; } catch { /* ok */ }
                     }
+                    try { fs.rmdirSync(userDir); } catch { /* ok */ }
                 }
             }
         }
 
-        res.json({ message: `Deleted ${totalDeleted} recordings for ${validIds.length} users`, deleted: totalDeleted });
+        res.json({ message: `Deleted ${totalDeleted} recordings`, deleted: totalDeleted });
     } catch (err) {
         console.error('Bulk delete recordings error:', err);
         res.status(500).json({ error: 'Server error' });
