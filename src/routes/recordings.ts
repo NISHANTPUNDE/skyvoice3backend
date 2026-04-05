@@ -218,6 +218,10 @@ router.get('/user/:userId', authMiddleware(['admin']), async (req: Request, res:
     try {
         const adminId = req.auth!.id;
         const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
+        const page = Math.max(1, parseInt(req.query.page as string) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 10));
+
+        const skip = (page - 1) * limit;
 
         // Verify ownership
         const userDoc = await User.findOne({ _id: userId, adminId }).select('_id').lean();
@@ -226,29 +230,51 @@ router.get('/user/:userId', authMiddleware(['admin']), async (req: Request, res:
             return;
         }
 
-        const result: Record<string, any[]> = {};
+        const result: Record<string, any> = {};
         const recDir = getRecordingsDir();
+
         if (!fs.existsSync(recDir)) {
             res.json(result);
             return;
         }
 
         const roomDirs = fs.readdirSync(recDir, { withFileTypes: true }).filter(d => d.isDirectory());
+
         for (const roomDir of roomDirs) {
             const userDir = path.join(recDir, roomDir.name, userId);
+
             if (fs.existsSync(userDir)) {
-                const files = fs.readdirSync(userDir).filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_')).sort();
-                if (files.length > 0) {
-                    result[roomDir.name] = files.map(filename => {
-                        const filepath = path.join(userDir, filename);
-                        const stats = fs.statSync(filepath);
-                        const startTime = parseSegmentTime(filename) || stats.mtimeMs;
-                        return { filename, startTime, size: stats.size };
-                    });
+                const allFiles = fs.readdirSync(userDir)
+                    .filter(f => (f.endsWith('.mp3') || f.endsWith('.webm')) && !f.startsWith('_'))
+                    .sort();
+
+                const total = allFiles.length;
+
+                const paginatedFiles = allFiles.slice(skip, skip + limit);
+
+                if (paginatedFiles.length > 0) {
+                    result[roomDir.name] = {
+                        total,
+                        page,
+                        limit,
+                        files: paginatedFiles.map(filename => {
+                            const filepath = path.join(userDir, filename);
+                            const stats = fs.statSync(filepath);
+                            const startTime = parseSegmentTime(filename) || stats.mtimeMs;
+
+                            return {
+                                filename,
+                                startTime,
+                                size: stats.size
+                            };
+                        })
+                    };
                 }
             }
         }
+
         res.json(result);
+
     } catch (err) {
         console.error('List user recordings error:', err);
         res.status(500).json({ error: 'Server error' });
