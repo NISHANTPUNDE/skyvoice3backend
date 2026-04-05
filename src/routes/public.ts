@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import * as path from 'path';
+import * as fs from 'fs';
 import { Admin } from '../models/Admin';
 import { getRecordingFilePath } from '../media/recording';
 
@@ -45,6 +46,32 @@ router.get('/config', async (req: Request, res: Response): Promise<void> => {
 
     } catch (err) {
         console.error('Public config error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// GET /api/public/download-apk
+// Serves the latest APK file from src/apk directory
+router.get('/download-apk', (req: Request, res: Response): void => {
+    try {
+        const apkDir = path.resolve(process.cwd(), 'src', 'apk');
+        if (!fs.existsSync(apkDir)) {
+            res.status(404).json({ error: 'APK directory not found' });
+            return;
+        }
+
+        const files = fs.readdirSync(apkDir);
+        const apkFile = files.find(file => file.endsWith('.apk'));
+
+        if (!apkFile) {
+            res.status(404).json({ error: 'No APK file available for download' });
+            return;
+        }
+
+        const filepath = path.join(apkDir, apkFile);
+        res.download(filepath, apkFile); // Forces download
+    } catch (err) {
+        console.error('APK download error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });
