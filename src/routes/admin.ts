@@ -108,7 +108,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
             }
 
             const hostOwner = await Admin.findOne({ subdomain: { $in: prefixes } });
-            
+
             if (hostOwner) {
                 if (String(hostOwner._id) !== String(admin._id)) {
                     res.status(403).json({ error: 'You are not authorized to log into this portal.' });
@@ -151,7 +151,7 @@ router.post('/users', authMiddleware(['admin']), async (req: Request, res: Respo
         }
 
         // Check username only within this admin's users
-        const existing = await User.findOne({ username: username.toLowerCase(), adminId: req.auth!.id, isDeleted: { $ne: true } });
+        const existing = await User.findOne({ username: username.toLowerCase(), isDeleted: { $ne: true } });
         if (existing) {
             res.status(409).json({ error: 'User with this username already exists' });
             return;
