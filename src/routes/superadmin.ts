@@ -37,7 +37,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
             return;
         }
 
-        if (host && host !== 'skai.deveraa.com' && !host.includes('localhost') && !host.includes('127.0.0.1')) {
+        if (host && host !== 'voicesup.live' && !host.includes('voicesup.live') && !host.includes('localhost') && !host.includes('127.0.0.1')) {
             res.status(403).json({ error: 'Super Admin login is only allowed on the main network.' });
             return;
         }

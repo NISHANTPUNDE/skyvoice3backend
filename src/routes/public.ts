@@ -17,8 +17,8 @@ router.get('/config', async (req: Request, res: Response): Promise<void> => {
         }
 
         const exactHost = host.toLowerCase();
-        
-        // Generate ['admin2.skai.deveraa.com', 'admin2.skai.deveraa', 'admin2.skai', 'admin2']
+
+        // Generate ['admin2.voicesup.live', 'admin2.skai.deveraa', 'admin2.skai', 'admin2']
         const parts = exactHost.split('.');
         const prefixes = [];
         for (let i = parts.length; i > 0; i--) {
