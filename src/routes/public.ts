@@ -31,8 +31,8 @@ router.get('/config', async (req: Request, res: Response): Promise<void> => {
             // If no match found, fallback to default branding
             res.json({
                 found: false,
-                name: 'Shubhvoice',
-                logoUrl: null, // Frontend will use default icon.jpeg
+                name: 'VoicesUp',
+                logoUrl: null, // Frontend will use default icon2.png
             });
             return;
         }
