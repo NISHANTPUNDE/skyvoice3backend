@@ -124,9 +124,13 @@ router.get('/rooms', authMiddleware(['user']), async (req: Request, res: Respons
 const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
 
 // GET /api/user/recordings — list all recordings for this user grouped by Room (Call Session)
+// Supports pagination: ?page=1&limit=20 (defaults: page=1, limit=20)
 router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Response): Promise<void> => {
     try {
         const userId = req.auth!.id;
+        const page = Math.max(1, parseInt(req.query.page as string) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 20));
+
         interface Segment {
             filename: string;
             startTime: number;
@@ -141,7 +145,7 @@ router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Re
         const sessions: CallSession[] = [];
 
         if (!fs.existsSync(RECORDINGS_DIR)) {
-            res.json([]);
+            res.json({ sessions: [], page, limit, totalSessions: 0, totalPages: 0, hasMore: false });
             return;
         }
 
@@ -192,7 +196,21 @@ router.get('/recordings', authMiddleware(['user']), async (req: Request, res: Re
 
         // Sort folders by newest session first
         sessions.sort((a, b) => b.startTime - a.startTime);
-        res.json(sessions);
+
+        // Paginate
+        const totalSessions = sessions.length;
+        const totalPages = Math.ceil(totalSessions / limit);
+        const start = (page - 1) * limit;
+        const paginatedSessions = sessions.slice(start, start + limit);
+
+        res.json({
+            sessions: paginatedSessions,
+            page,
+            limit,
+            totalSessions,
+            totalPages,
+            hasMore: page < totalPages,
+        });
     } catch (err) {
         console.error('User recordings error:', err);
         res.status(500).json({ error: 'Server error' });
