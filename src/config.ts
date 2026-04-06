@@ -25,7 +25,7 @@ export const config = {
                     kind: 'audio' as const,
                     mimeType: 'audio/opus',
                     clockRate: 48000,
-                    channels: 1,
+                    channels: 2,
                 },
             ],
         },
