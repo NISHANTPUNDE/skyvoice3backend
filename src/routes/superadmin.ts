@@ -31,14 +31,9 @@ const router = Router();
 // POST /api/superadmin/login
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
     try {
-        const { username, password, host } = req.body;
+        const { username, password } = req.body;
         if (!username || !password) {
             res.status(400).json({ error: 'Username and password are required' });
-            return;
-        }
-
-        if (host && host !== process.env.HOST_URL && !host.includes(process.env.HOST_URL) && !host.includes('localhost') && !host.includes('127.0.0.1')) {
-            res.status(403).json({ error: 'Super Admin login is only allowed on the main network.' });
             return;
         }
 
