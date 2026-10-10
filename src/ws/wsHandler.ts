@@ -833,6 +833,20 @@ async function handleMessage(ws: WebSocket, auth: AuthPayload, msg: any) {
             break;
         }
 
+        // ══════════════════════════════════════════
+        //  LIVENESS
+        // ══════════════════════════════════════════
+
+        // Application-level heartbeat. The WebSocket protocol ping/pong is not
+        // surfaced to React Native's WebSocket, so a client cannot otherwise tell
+        // a half-open socket (phone suspended, NAT rebind) from a healthy idle one
+        // until it tries to speak. Answering here lets the client detect a dead
+        // link during a long silence and re-join on its own.
+        case 'ping': {
+            sendJson(ws, { type: 'pong', t: msg.t });
+            break;
+        }
+
         default:
             sendJson(ws, { type: 'error', message: `Unknown message type: ${msg.type}` });
     }

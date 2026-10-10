@@ -86,7 +86,10 @@ router.get('/me', authMiddleware(['user']), async (req: Request, res: Response):
             return;
         }
         const admin = await (await import('../models/Admin')).Admin.findById(user.adminId, 'name logoUrl');
+        // Rolling session: re-issue a fresh token on every profile sync so an app that
+        // is opened at least once per expiry window never falls back to the login screen.
         res.json({
+            token: generateToken({ id: String(user._id), role: 'user' }),
             name: user.name,
             username: user.username,
             adminName: admin?.name || 'Admin',

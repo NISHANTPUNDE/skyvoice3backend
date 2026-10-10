@@ -5,6 +5,10 @@ export const config = {
     port: parseInt(process.env.PORT || '3001', 10),
     mongoUri: process.env.MONGO_URI || 'mongodb://localhost:27017/skyvoice2',
     jwtSecret: process.env.JWT_SECRET || 'skyvoice2-secret-key-change-in-production',
+    // Session lifetime for issued JWTs. Long-lived because the mobile app is a
+    // background PTT client that may sit unopened for days between shifts;
+    // /api/user/me also re-issues a fresh token on each app launch (rolling session).
+    jwtExpiresIn: process.env.JWT_EXPIRES_IN || '60d',
 
     // SuperAdmin seed credentials
     superAdminUsername: process.env.SUPER_ADMIN_USERNAME || 'superadmin',

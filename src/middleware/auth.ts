@@ -41,5 +41,7 @@ export function authMiddleware(allowedRoles: AuthPayload['role'][]) {
 }
 
 export function generateToken(payload: AuthPayload): string {
-    return jwt.sign(payload, config.jwtSecret, { expiresIn: '7d' });
+    return jwt.sign(payload, config.jwtSecret, {
+        expiresIn: config.jwtExpiresIn as jwt.SignOptions['expiresIn'],
+    });
 }
